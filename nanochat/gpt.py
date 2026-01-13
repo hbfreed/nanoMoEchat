@@ -279,11 +279,8 @@ class MoEMLP(nn.Module):
 
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
 
-        experts_flat = rearrange(selected_experts, "... -> (...)")
-
-        f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
-        ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
-        f_i.scatter_add_(0, experts_flat, ones)
+        # Reuse histogram from routing instead of slow scatter_add_
+        f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
         load_balance_loss = self._compute_load_balance_loss(
             router_probs, selected_experts_flat, f_i
         )
