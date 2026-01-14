@@ -29,7 +29,6 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import DistMuon, Muon
 from nanochat.topology_var import topology_var
 
-
 @dataclass
 class GPTConfig:
     sequence_len: int = 1024
@@ -222,7 +221,10 @@ class MoEMLP(nn.Module):
             persistent=False,
         )
 
-    @torch.compiler.disable  # :(
+
+    # Disable torch.compile tracing for MoE - triton kernels (stk.ops.row_indices etc)
+    # can't handle FakeTensors used during compile tracing
+    @torch.compiler.disable
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
 
@@ -255,20 +257,27 @@ class MoEMLP(nn.Module):
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
             selected_experts_flat
         )
+
+        # Compute bins for gather/scatter
+        bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+
+        # Build topology dynamically each forward (like dMoE)
         padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
-        x_permuted = self._gather_tokens(
-            x_flat, indices, bin_ids, tokens_per_expert, padded_bins
+
+        x_permuted = ops.padded_gather(
+            x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
         )
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
         x_permuted = relu_squared(x_permuted)
         x_permuted = stk.ops.dsd(x_permuted, self.w2)
-        x_permuted = self._scatter_tokens(
+        x_permuted = ops.padded_scatter(
             x_permuted,
             indices,
             bin_ids,
             top_k_weights_flat,
-            tokens_per_expert,
+            bins,
             padded_bins,
+            self.num_active_experts,
         )
         output = rearrange(
             x_permuted,
@@ -427,11 +436,11 @@ class MoEMLP(nn.Module):
 
         if len(set(self.expert_widths)) == 1:
             # for uniform expert sizes, just compute regular lbl loss
-            return self.num_experts * (f_i @ p_i)
+            return self.num_experts * (f_i.float() @ p_i)
 
         expert_sizes_spec = getattr(self.config, "expert_sizes", None)
         if expert_sizes_spec is None:
-            return self.num_experts * (f_i @ p_i)
+            return self.num_experts * (f_i.float() @ p_i)
 
         group_losses = []
         expert_idx = 0

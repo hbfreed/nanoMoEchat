@@ -118,8 +118,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Precision - use TF32 for matmuls on Ampere+ GPUs
     if device_type == "cuda":
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
