@@ -339,9 +339,7 @@ class MoEMLP(nn.Module):
         )
 
         # Compute all expert token blocks at once
-        prepend = padded_bins.new_zeros(1)
-        bin_sizes = torch.diff(padded_bins, prepend=prepend)
-        expert_token_blocks = bin_sizes // self.block_size
+        expert_token_blocks = padded_tokens_per_expert // self.block_size
 
         # Repeat each expert's size by how many token blocks it handles
         repeated_sizes = torch.repeat_interleave(
@@ -411,20 +409,24 @@ class MoEMLP(nn.Module):
         offsets_t = torch.cat([zero, nnz_per_column])
         return column_indices_t, offsets_t, block_offsets_t
 
-    def _gather_tokens(self, x, indices, bin_ids, tokens_per_expert, padded_bins):
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
-        bins = bins.contiguous()
+    def _gather_tokens(
+        self, x, indices, bin_ids, tokens_per_expert, padded_bins, bins=None
+    ):
+        if bins is None:
+            bins = ops.inclusive_cumsum(tokens_per_expert, 0)
+            bins = bins.contiguous()
 
         return ops.padded_gather(
             x, indices, bin_ids, bins, padded_bins, self.num_active_experts
         )
 
     def _scatter_tokens(
-        self, x, indices, bin_ids, weights, tokens_per_expert, padded_bins
+        self, x, indices, bin_ids, weights, tokens_per_expert, padded_bins, bins=None
     ):
         """Un-permute tokens and apply expert weights."""
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0)
-        bins = bins.contiguous()
+        if bins is None:
+            bins = ops.inclusive_cumsum(tokens_per_expert, 0)
+            bins = bins.contiguous()
 
         return ops.padded_scatter(
             x, indices, bin_ids, weights, bins, padded_bins, self.num_active_experts
