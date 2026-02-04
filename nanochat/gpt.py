@@ -38,11 +38,13 @@ class GPTConfig:
     n_kv_head: int = 6  # number of key/value heads (MQA)
     n_embd: int = 768
     use_moe: bool = True
+    use_triton_moe: bool = True  # Use Triton kernels instead of stk (requires triton-variable-moe)
     expert_sizes: list = field(
         default_factory=lambda: [(64, 256)]
     )  # 64 fine-grained experts
     num_active_experts: int = 8
     norm_topk_prob: bool = True
+    block_size: int = 128  # Triton kernel tile size for MoE
     load_balance_loss_weight: float = 0.08
     router_z_loss_weight: float = 0.001
     compute_loss_weight: float = 0.004
@@ -508,7 +510,19 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         if config.use_moe:
-            self.mlp = MoEMLP(config)
+            if config.use_triton_moe:
+                from triton_moe import TritonMoEMLP, TritonMoEConfig
+
+                tri_config = TritonMoEConfig(
+                    n_embd=config.n_embd,
+                    expert_sizes=config.expert_sizes,
+                    num_active_experts=config.num_active_experts,
+                    norm_topk_prob=config.norm_topk_prob,
+                    block_size=config.block_size,
+                )
+                self.mlp = TritonMoEMLP(tri_config)
+            else:
+                self.mlp = MoEMLP(config)
         else:
             self.mlp = MLP(config)
 
