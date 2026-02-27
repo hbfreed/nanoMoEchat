@@ -208,7 +208,9 @@ class MoEMLP(nn.Module):
             persistent=False,
         )
 
-        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        # Blog post approach: single null expert logit, expanded to M copies in forward
+        router_size = self.num_real_experts + (1 if self.num_null_experts > 0 else 0)
+        self.router = nn.Linear(config.n_embd, router_size, bias=False)
 
         self.w1 = nn.Parameter(torch.empty(config.n_embd, self.total_expert_width))
         self.w2 = nn.Parameter(torch.empty(self.total_expert_width, config.n_embd))
@@ -295,6 +297,14 @@ class MoEMLP(nn.Module):
 
         router_logits = self.router(x_flat)
 
+        if self.num_null_experts > 0:
+            # Single null expert, expand logit to M copies (arXiv 2601.15370)
+            null_logit = router_logits[:, self.num_real_experts:]  # (T, 1)
+            router_logits = torch.cat([
+                router_logits[:, :self.num_real_experts],
+                null_logit.expand(-1, self.num_null_experts),
+            ], dim=-1)  # (T, N+M)
+
         # router_probs = F.softmax(
         #     router_logits, dim=-1, dtype=torch.float32
         # )
@@ -321,9 +331,13 @@ class MoEMLP(nn.Module):
             tokens_per_expert_all = ops.histogram(
                 rearrange(selected_experts, "... -> (...)"), self.num_experts
             )
-            # Remap null expert IDs to expert 0 for compute path
+            # Remap null IDs uniformly across real experts for compute path
             # (weights are 0, so scatter adds nothing — output is correct)
-            selected_experts = selected_experts.masked_fill(is_null, 0)
+            # Spread by flat position to avoid load imbalance on any single expert
+            null_remap = torch.arange(
+                selected_experts.numel(), device=selected_experts.device
+            ).view(selected_experts.shape) % self.num_real_experts
+            selected_experts = torch.where(is_null, null_remap, selected_experts)
 
         top_k_weights = top_k_weights / (
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
@@ -348,10 +362,10 @@ class MoEMLP(nn.Module):
 
         if self.use_bias_balancing and self.training:
             with torch.no_grad():
-                avg_tokens = tokens_per_expert.float().mean()
+                avg_tokens = tokens_per_expert_all.float().mean()
                 self.expert_bias -= self.bias_update_speed * (
-                    (tokens_per_expert.float() > avg_tokens).float()
-                    - (tokens_per_expert.float() < avg_tokens).float()
+                    (tokens_per_expert_all.float() > avg_tokens).float()
+                    - (tokens_per_expert_all.float() < avg_tokens).float()
                 )
 
         # Compute bins for gather/scatter
