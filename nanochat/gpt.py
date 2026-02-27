@@ -51,6 +51,7 @@ class GPTConfig:
     load_balance_loss_weight: float = 0.08
     router_z_loss_weight: float = 0.001
     compute_loss_weight: float = 0.004
+    num_null_experts: int = 0
     use_bias_balancing: bool = False
     bias_update_speed: float = 0.001
 
@@ -171,7 +172,9 @@ class MoEMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.num_experts = sum(count for count, _ in config.expert_sizes)
+        self.num_real_experts = sum(count for count, _ in config.expert_sizes)
+        self.num_null_experts = config.num_null_experts
+        self.num_experts = self.num_real_experts + self.num_null_experts
         self.num_active_experts = config.num_active_experts
         self.norm_topk_prob = config.norm_topk_prob
         self.block_size = 128  # always will be 128.
@@ -193,12 +196,15 @@ class MoEMLP(nn.Module):
             self.register_buffer("expert_bias", torch.zeros(self.num_experts))
 
         # compute normalized expert widths for aux losses
-        mean_expert_width = sum(self.expert_widths) / self.num_experts
+        mean_expert_width = sum(self.expert_widths) / self.num_real_experts
+        expert_widths_normalized = torch.tensor(
+            [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32
+        )
+        if self.num_null_experts > 0:
+            expert_widths_normalized = torch.cat([expert_widths_normalized, torch.zeros(self.num_null_experts)])
         self.register_buffer(
             "expert_widths_normalized",
-            torch.tensor(
-                [w / mean_expert_width for w in self.expert_widths], dtype=torch.float32
-            ),
+            expert_widths_normalized,
             persistent=False,
         )
 
@@ -307,6 +313,11 @@ class MoEMLP(nn.Module):
             top_k_weights, selected_experts = torch.topk(
                 router_probs, self.num_active_experts, dim=-1
             )
+
+        if self.num_null_experts > 0:
+            is_null = (selected_experts >= self.num_real_experts)
+            top_k_weights = top_k_weights.masked_fill(is_null, 0.0)
+
         top_k_weights = top_k_weights / (
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
         )  # epsilon so we don't divide by 0
@@ -316,9 +327,14 @@ class MoEMLP(nn.Module):
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
-        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
+        bin_ids, indices, tokens_per_expert_all = self._sort_tokens_by_expert(
             selected_experts_flat
         )
+
+        if self.num_null_experts > 0:
+            tokens_per_expert = tokens_per_expert_all[:self.num_real_experts]
+        else:
+            tokens_per_expert = tokens_per_expert_all
 
         if self.use_bias_balancing and self.training:
             with torch.no_grad():
@@ -358,9 +374,15 @@ class MoEMLP(nn.Module):
 
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
 
-        # Reuse histogram from routing instead of slow scatter_add_
-        f_i = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
-        load_balance_loss = self._compute_load_balance_loss(router_probs, f_i)
+        if self.num_null_experts > 0:
+            # Global LBL over all experts (real + null)
+            f_i_all = tokens_per_expert_all.float() / tokens_per_expert_all.sum()
+            p_i = router_probs.mean(dim=0)
+            load_balance_loss = self.num_experts * (f_i_all.float() @ p_i.float())
+        else:
+            f_i_all = (tokens_per_expert.float() / tokens_per_expert.sum()).to(x.dtype)
+            load_balance_loss = self._compute_load_balance_loss(router_probs, f_i_all)
+
         router_probs_flat = rearrange(
             router_probs,
             "(batch_size seq_len) n_embd -> (batch_size seq_len) n_embd",
@@ -383,8 +405,12 @@ class MoEMLP(nn.Module):
             aux_loss["expert_bias_abs_max"] = self.expert_bias.abs().max()
             aux_loss["expert_bias_abs_mean"] = self.expert_bias.abs().mean()
             aux_loss["expert_bias_vector"] = self.expert_bias.detach().clone()
+        if self.num_null_experts > 0:
+            aux_loss["null_fraction"] = is_null.float().mean().detach()
+            aux_loss["real_experts_per_token"] = (~is_null).float().sum(dim=-1).mean().detach()
+            aux_loss["zero_compute_token_fraction"] = ((~is_null).sum(dim=-1) == 0).float().mean().detach()
 
-        return output, aux_loss, f_i
+        return output, aux_loss, f_i_all
 
     def _sort_tokens_by_expert(self, selected_experts_flat):
         """Group token assignments by expert id."""
@@ -512,7 +538,7 @@ class MoEMLP(nn.Module):
 
         if len(set(self.expert_widths)) == 1:
             # for uniform expert sizes, just compute regular lbl loss
-            return self.num_experts * (f_i.float() @ p_i.float())
+            return self.num_real_experts * (f_i.float() @ p_i.float())
 
         if self._num_valid_groups == 0:
             return f_i.float() @ p_i.float()

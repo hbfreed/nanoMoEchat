@@ -56,6 +56,7 @@ num_active_experts = 8  # top-k experts per token
 load_balance_loss_weight = 0.08
 router_z_loss_weight = 0.001
 compute_loss_weight = 0.004
+num_null_experts = 0
 use_bias_balancing = False
 bias_update_speed = 0.001
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
@@ -162,6 +163,7 @@ model_config_kwargs = dict(
     n_embd=model_dim,
     expert_sizes=expert_sizes,
     num_active_experts=num_active_experts,
+    num_null_experts=num_null_experts,
     load_balance_loss_weight=load_balance_loss_weight,
     router_z_loss_weight=router_z_loss_weight,
     compute_loss_weight=compute_loss_weight,
@@ -448,6 +450,10 @@ for step in range(num_iterations + 1):
             if "expert_bias_abs_max" in combined_aux_loss:
                 log_dict["train/expert_bias_abs_max"] = combined_aux_loss["expert_bias_abs_max"].item()
                 log_dict["train/expert_bias_abs_mean"] = combined_aux_loss["expert_bias_abs_mean"].item()
+            if "null_fraction" in combined_aux_loss:
+                log_dict["train/null_fraction"] = combined_aux_loss["null_fraction"].item()
+                log_dict["train/real_experts_per_token"] = combined_aux_loss["real_experts_per_token"].item()
+                log_dict["train/zero_compute_token_fraction"] = combined_aux_loss["zero_compute_token_fraction"].item()
             if "expert_usage" in combined_aux_loss:
                 for j, val in enumerate(combined_aux_loss["expert_usage"]):
                     log_dict[f"train/expert_usage_{j}"] = val.item()
