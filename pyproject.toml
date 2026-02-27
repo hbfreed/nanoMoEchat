@@ -71,9 +71,10 @@ explicit = true
 cpu = [  
     "torch>=2.8.0",  
 ]  
-gpu = [  
-    "torch>=2.8.0",  
-]  
+gpu = [
+    "torch>=2.8.0",
+    "triton",
+]
   
 [tool.uv]
 prerelease = "allow"
