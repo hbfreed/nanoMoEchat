@@ -333,6 +333,10 @@ class MoEMLP(nn.Module):
 
         if self.num_null_experts > 0:
             tokens_per_expert = tokens_per_expert_all[:self.num_real_experts]
+            num_real_slots = tokens_per_expert.sum().item()
+            bin_ids = bin_ids[:num_real_slots]
+            indices = indices[:num_real_slots]
+            top_k_weights_flat = top_k_weights_flat[:num_real_slots]
         else:
             tokens_per_expert = tokens_per_expert_all
 
