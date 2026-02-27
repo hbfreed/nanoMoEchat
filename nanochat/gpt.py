@@ -334,13 +334,16 @@ class MoEMLP(nn.Module):
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
-        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
-            selected_experts_flat
-        )
-
         if self.num_null_experts > 0:
-            tokens_per_expert = tokens_per_expert[:self.num_real_experts]
+            # After remap, all IDs are 0..num_real_experts-1.
+            # Sort with full bit width (fine), but histogram only over real experts
+            # so bins/padded_bins size matches bin_ids range exactly.
+            bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
+            tokens_per_expert = ops.histogram(selected_experts_flat, self.num_real_experts)
         else:
+            bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
+                selected_experts_flat
+            )
             tokens_per_expert_all = tokens_per_expert
 
         if self.use_bias_balancing and self.training:
