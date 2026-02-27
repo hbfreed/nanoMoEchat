@@ -49,9 +49,12 @@ python_functions = ["test_*"]
 
 # target torch to cuda 12.8 or CPU
 [tool.uv.sources]
-torch = [  
-    { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "gpu" },  
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "gpu" },
+]
+triton = [
+    { index = "pytorch-cu128", extra = "gpu" },
 ]
 
 [[tool.uv.index]]  
@@ -60,8 +63,8 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true  
   
 [[tool.uv.index]]  
-name = "pytorch-cu128"  
-url = "https://download.pytorch.org/whl/cu128"  
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/nightly/cu128"
 explicit = true
 
 [project.optional-dependencies]  
@@ -72,10 +75,11 @@ gpu = [
     "torch>=2.8.0",  
 ]  
   
-[tool.uv]  
-conflicts = [  
-    [  
-        { extra = "cpu" },  
-        { extra = "gpu" },  
-    ],  
-]  
+[tool.uv]
+prerelease = "allow"
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
