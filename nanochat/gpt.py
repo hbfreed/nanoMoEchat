@@ -317,6 +317,13 @@ class MoEMLP(nn.Module):
         if self.num_null_experts > 0:
             is_null = (selected_experts >= self.num_real_experts)
             top_k_weights = top_k_weights.masked_fill(is_null, 0.0)
+            # Histogram original routing for loss computation
+            tokens_per_expert_all = ops.histogram(
+                rearrange(selected_experts, "... -> (...)"), self.num_experts
+            )
+            # Remap null expert IDs to expert 0 for compute path
+            # (weights are 0, so scatter adds nothing — output is correct)
+            selected_experts = selected_experts.masked_fill(is_null, 0)
 
         top_k_weights = top_k_weights / (
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
@@ -327,18 +334,14 @@ class MoEMLP(nn.Module):
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
-        bin_ids, indices, tokens_per_expert_all = self._sort_tokens_by_expert(
+        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
             selected_experts_flat
         )
 
         if self.num_null_experts > 0:
-            tokens_per_expert = tokens_per_expert_all[:self.num_real_experts]
-            num_real_slots = tokens_per_expert.sum().item()
-            bin_ids = bin_ids[:num_real_slots]
-            indices = indices[:num_real_slots]
-            top_k_weights_flat = top_k_weights_flat[:num_real_slots]
+            tokens_per_expert = tokens_per_expert[:self.num_real_experts]
         else:
-            tokens_per_expert = tokens_per_expert_all
+            tokens_per_expert_all = tokens_per_expert
 
         if self.use_bias_balancing and self.training:
             with torch.no_grad():
