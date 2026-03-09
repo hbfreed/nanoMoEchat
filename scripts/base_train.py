@@ -20,7 +20,7 @@ from contextlib import nullcontext
 import torch
 
 import wandb
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import find_last_step, load_checkpoint, save_checkpoint
 from nanochat.common import (
     DummyWandb,
     autodetect_device_type,
@@ -84,6 +84,8 @@ model_tag = (
     ""  # optionally override the model tag for the output checkpoint directory name
 )
 save_every = -1  # save checkpoint every N steps (-1 = only at end)
+resume_from = ""  # checkpoint directory to resume from (empty = train from scratch)
+resume_step = -1  # step to resume from (-1 = auto-detect latest)
 # now allow CLI to override the settings via the configurator lol
 config_keys = [
     k
@@ -228,6 +230,23 @@ optimizers = model.setup_optimizers(
 )
 adamw_optimizer, muon_optimizer = optimizers
 
+# -----------------------------------------------------------------------------
+# Optionally resume from a checkpoint
+start_step = 0
+if resume_from:
+    ckpt_step = resume_step if resume_step >= 0 else find_last_step(resume_from)
+    print0(f"Resuming from checkpoint: {resume_from} at step {ckpt_step}")
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        resume_from, ckpt_step, device, load_optimizer=True
+    )
+    # Load model weights in-place (preserves parameter references held by optimizers)
+    orig_model.load_state_dict(model_data, strict=True)
+    # Load optimizer states
+    for opt, opt_state in zip(optimizers, optimizer_data):
+        opt.load_state_dict(opt_state)
+    start_step = ckpt_step
+    print0(f"Resumed successfully. Training will start from step {start_step}.")
+
 # Initialize the DataLoaders for train/val
 base_dir = get_base_dir()
 tokens_dir = os.path.join(base_dir, "tokenized_data")
@@ -275,7 +294,7 @@ smooth_train_loss = 0  # EMA of training loss
 ema_beta = 0.9  # EMA decay factor
 total_training_time = 0  # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -456,15 +475,15 @@ for step in range(num_iterations + 1):
                 log_dict["train/zero_compute_token_fraction"] = combined_aux_loss["zero_compute_token_fraction"].item()
             if "expert_usage" in combined_aux_loss:
                 for j, val in enumerate(combined_aux_loss["expert_usage"]):
-                    log_dict[f"train/expert_usage_{j}"] = val.item()
+                    log_dict[f"moe/expert_usage_{j}"] = val.item()
             if step % 1000 == 0 and "expert_bias_per_layer" in combined_aux_loss:
                 for i, bias_vec in enumerate(combined_aux_loss["expert_bias_per_layer"]):
                     for j, val in enumerate(bias_vec):
-                        log_dict[f"train/expert_bias_layer_{i}_expert_{j}"] = val.item()
+                        log_dict[f"moe/expert_bias_layer_{i}_expert_{j}"] = val.item()
             if step % 1000 == 0 and "expert_usage_per_layer" in combined_aux_loss:
                 for i, usage_vec in enumerate(combined_aux_loss["expert_usage_per_layer"]):
                     for j, val in enumerate(usage_vec):
-                        log_dict[f"train/expert_usage_layer_{i}_expert_{j}"] = val.item()
+                        log_dict[f"moe/expert_usage_layer_{i}_expert_{j}"] = val.item()
         wandb_run.log(log_dict)
 
 # print a few more stats

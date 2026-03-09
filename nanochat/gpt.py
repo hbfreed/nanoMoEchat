@@ -331,13 +331,6 @@ class MoEMLP(nn.Module):
             tokens_per_expert_all = ops.histogram(
                 rearrange(selected_experts, "... -> (...)"), self.num_experts
             )
-            # Remap null IDs uniformly across real experts for compute path
-            # (weights are 0, so scatter adds nothing — output is correct)
-            # Spread by flat position to avoid load imbalance on any single expert
-            null_remap = torch.arange(
-                selected_experts.numel(), device=selected_experts.device
-            ).view(selected_experts.shape) % self.num_real_experts
-            selected_experts = torch.where(is_null, null_remap, selected_experts)
 
         top_k_weights = top_k_weights / (
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
@@ -349,11 +342,10 @@ class MoEMLP(nn.Module):
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
         if self.num_null_experts > 0:
-            # After remap, all IDs are 0..num_real_experts-1.
-            # Sort with full bit width (fine), but histogram only over real experts
-            # so bins/padded_bins size matches bin_ids range exactly.
+            # Sort all experts; null experts have highest IDs so sort last.
             bin_ids, indices = ops.sort(selected_experts_flat, self.sort_end_bit)
-            tokens_per_expert = ops.histogram(selected_experts_flat, self.num_real_experts)
+            tokens_per_expert_full = ops.histogram(selected_experts_flat, self.num_experts)
+            tokens_per_expert = tokens_per_expert_full[:self.num_real_experts]
         else:
             bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
                 selected_experts_flat
@@ -368,27 +360,45 @@ class MoEMLP(nn.Module):
                     - (tokens_per_expert_all.float() < avg_tokens).float()
                 )
 
-        # Compute bins for gather/scatter
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+        # Build topology for real experts only
+        padded_bins_real, topology = self._create_topology(x_flat, tokens_per_expert)
 
-        # Build topology dynamically each forward (like dMoE)
-        padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
+        if self.num_null_experts > 0:
+            # Full bins for gather/scatter (all experts including null)
+            bins = ops.inclusive_cumsum(tokens_per_expert_full, 0).contiguous()
+            padded_tpe_full = ops.round_up(tokens_per_expert_full, self.block_size)
+            padded_bins = ops.inclusive_cumsum(padded_tpe_full, 0).contiguous()
+            padded_rows_real = padded_bins[self.num_real_experts - 1].item()
 
-        x_permuted = ops.padded_gather(
-            x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
-        )
-        x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
-        x_permuted = relu_squared(x_permuted)
-        x_permuted = stk.ops.dsd(x_permuted, self.w2)
-        x_permuted = ops.padded_scatter(
-            x_permuted,
-            indices,
-            bin_ids,
-            top_k_weights_flat,
-            bins,
-            padded_bins,
-            self.num_active_experts,
-        )
+            # Gather all tokens (null expert rows land at the end)
+            x_permuted = ops.padded_gather(
+                x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
+            )
+            # Slice real prefix → expert compute → cat null suffix back
+            # Null rows keep raw gathered data, but weight=0 zeroes them in scatter
+            x_real = x_permuted[:padded_rows_real]
+            x_real = stk.ops.sdd(x_real, self.w1, topology)
+            x_real = relu_squared(x_real)
+            x_real = stk.ops.dsd(x_real, self.w2)
+            x_permuted = torch.cat([x_real, x_permuted[padded_rows_real:]], dim=0)
+            x_permuted = ops.padded_scatter(
+                x_permuted, indices, bin_ids, top_k_weights_flat,
+                bins, padded_bins, self.num_active_experts,
+            )
+        else:
+            # Compute bins for gather/scatter
+            bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+
+            x_permuted = ops.padded_gather(
+                x_flat, indices, bin_ids, bins, padded_bins_real, self.num_active_experts
+            )
+            x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
+            x_permuted = relu_squared(x_permuted)
+            x_permuted = stk.ops.dsd(x_permuted, self.w2)
+            x_permuted = ops.padded_scatter(
+                x_permuted, indices, bin_ids, top_k_weights_flat,
+                bins, padded_bins_real, self.num_active_experts,
+            )
         output = rearrange(
             x_permuted,
             "(batch_size seq_len) n_embd -> batch_size seq_len n_embd",
