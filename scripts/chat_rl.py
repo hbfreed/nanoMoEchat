@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb
-from nanochat.checkpoint_manager import save_checkpoint, load_model
+from nanochat.checkpoint_manager import save_checkpoint, load_model, wait_for_checkpoint
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
@@ -274,4 +274,6 @@ from nanochat.report import get_report
 get_report().log(section="Chat RL", data=[user_config])
 
 wandb_run.finish()
+if master_process:
+    wait_for_checkpoint()
 compute_cleanup()

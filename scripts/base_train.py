@@ -21,7 +21,7 @@ import argparse
 import torch
 
 import wandb
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, wait_for_checkpoint
 from nanochat.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -49,6 +49,7 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-run-id", type=str, default="", help="resume this existing wandb run id instead of creating a new one")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
@@ -91,6 +92,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 # Output
 parser.add_argument("--model-tag", type=str, default="", help="override model tag for checkpoint directory name")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
+parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
@@ -118,11 +120,15 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = (
-    DummyWandb()
-    if use_dummy_wandb
-    else wandb.init(project="nanochat", name=args.run, config=user_config)
-)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    wandb_kwargs = dict(project="nanochat", name=args.run, config=user_config)
+    if args.wandb_run_id:
+        # Resume the existing wandb run so charts stay continuous across crashes.
+        wandb_kwargs["id"] = args.wandb_run_id
+        wandb_kwargs["resume"] = "allow"
+    wandb_run = wandb.init(**wandb_kwargs)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -233,8 +239,34 @@ optimizers = model.setup_optimizers(
 )
 adamw_optimizer, muon_optimizer = optimizers
 
-# Initialize the DataLoaders for train/val
+# Resume from a previous checkpoint if requested (load model + optimizer state)
 base_dir = get_base_dir()
+start_step = 0
+if args.resume_from_step != -1:
+    resume_tag = args.model_tag if args.model_tag else f"d{num_layers}"
+    resume_dir = os.path.join(base_dir, "base_checkpoints", resume_tag)
+    print0(f"Resuming from step {args.resume_from_step} in {resume_dir}")
+    model_data, optimizer_data, _meta = load_checkpoint(
+        resume_dir, args.resume_from_step, device, load_optimizer=True
+    )
+    # Strip torch.compile's "_orig_mod." prefix from state_dict keys
+    model_data = {k.lstrip("_orig_mod."): v for k, v in model_data.items()}
+    # assign=False (in-place copy) so optimizer's param references stay valid.
+    # assign=True would swap the tensors, orphaning Muon's stored param refs.
+    orig_model.load_state_dict(model_data, strict=True, assign=False)
+    assert isinstance(optimizer_data, list) and len(optimizer_data) == 2, \
+        "expected a 2-element list [adamw_state, muon_state]"
+    adamw_optimizer.load_state_dict(optimizer_data[0])
+    muon_optimizer.load_state_dict(optimizer_data[1])
+    start_step = args.resume_from_step
+    del model_data, optimizer_data
+    # Protect the resume checkpoint from keep_last_n pruning (touch sentinel).
+    if master_process:
+        resume_model_path = os.path.join(resume_dir, f"model_{args.resume_from_step:06d}.pt")
+        if os.path.exists(resume_model_path):
+            open(resume_model_path + ".protected", "w").close()
+
+# Initialize the DataLoaders for train/val
 train_loader = tokenizing_distributed_data_loader(
     device_batch_size, max_seq_len, split="train", device=device
 )
@@ -282,7 +314,7 @@ sample_every = args.sample_every
 model_tag = args.model_tag
 
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -346,11 +378,20 @@ for step in range(num_iterations + 1):
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint periodically and at the end (only on master process)
-    should_save = last_step or (save_every > 0 and step > 0 and step % save_every == 0)
+    # save checkpoint periodically and at the end (only on master process).
+    # Also always save at the last pre-decay step so WSD resumes can grab a clean
+    # stable-phase checkpoint regardless of save_every cadence.
+    warmdown_start = num_iterations - round(warmdown_ratio * num_iterations)
+    at_warmdown_start = step == warmdown_start and warmdown_ratio > 0
+    should_save = last_step or at_warmdown_start or (save_every > 0 and step > 0 and step % save_every == 0)
     if master_process and should_save:
         output_dirname = model_tag if model_tag else f"d{depth}"  # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+        # Protect "important" saves from pruning: the pre-decay snapshot
+        # (so WSD continuations always have a clean stable-phase entry) and
+        # the final step.
+        protect = at_warmdown_start or last_step
+        keep_last_n = args.keep_last_n if args.keep_last_n > 0 else None
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -364,6 +405,8 @@ for step in range(num_iterations + 1):
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
             },
+            protect=protect,
+            keep_last_n=keep_last_n,
         )
 
     if last_step:
@@ -481,4 +524,8 @@ get_report().log(
 
 # cleanup
 wandb_run.finish()
+# Ensure the final async checkpoint save is flushed to disk before we tear
+# down the distributed / CUDA runtime.
+if master_process:
+    wait_for_checkpoint()
 compute_cleanup()

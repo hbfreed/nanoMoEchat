@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nanochat.checkpoint_manager import load_model, save_checkpoint
+from nanochat.checkpoint_manager import load_model, save_checkpoint, wait_for_checkpoint
 from nanochat.common import (
     DummyWandb,
     autodetect_device_type,
@@ -310,4 +310,6 @@ get_report().log(
 
 # Cleanup
 wandb_run.finish()
+if master_process:
+    wait_for_checkpoint()
 compute_cleanup()

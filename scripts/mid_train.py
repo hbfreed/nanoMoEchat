@@ -20,7 +20,7 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nanochat.checkpoint_manager import load_model, save_checkpoint
+from nanochat.checkpoint_manager import load_model, save_checkpoint, wait_for_checkpoint
 from nanochat.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -372,4 +372,6 @@ if not args.dry_run:
 
 # cleanup
 wandb_run.finish()
+if master_process:
+    wait_for_checkpoint()
 compute_cleanup()

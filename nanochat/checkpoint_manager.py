@@ -6,6 +6,7 @@ import re
 import glob
 import json
 import logging
+import threading
 import torch
 
 from nanochat.common import get_base_dir
@@ -20,23 +21,139 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data):
-    assert int(os.environ.get('RANK', 0)) == 0 # prevent footguns for now
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    # Save the model state (parameters)
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    torch.save(model_data, model_path)
-    log0(f"Saved model file to: {model_path}")
-    # Save the optimizer state (useful for SFT or any other fine-tuning)
-    if optimizer_data is not None:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
-        torch.save(optimizer_data, optimizer_path)
-        log0(f"Saved optimizer file to: {optimizer_path}")
-    # Save the metadata dict as json
-    meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-    with open(meta_path, "w") as f:
-        json.dump(meta_data, f, indent=2)
-    log0(f"Saved metadata file to: {meta_path}")
+# Background thread for the most recent async checkpoint save (master rank only).
+_save_thread = None
+_save_error = None
+
+
+def _to_cpu_state(obj):
+    """Recursively clone tensors in a state_dict-like structure to CPU.
+
+    Done synchronously on the caller (training) thread so the background writer
+    operates on a snapshot independent of subsequent optimizer steps.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu", copy=True)
+    if isinstance(obj, dict):
+        return {k: _to_cpu_state(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_state(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_state(v) for v in obj)
+    return obj
+
+
+def _atomic_torch_save(data, path):
+    """Write via .tmp then rename, so a crash mid-write can't leave a torn file."""
+    tmp = path + ".tmp"
+    torch.save(data, tmp)
+    os.replace(tmp, path)
+
+
+def _prune_old_checkpoints(checkpoint_dir, keep_last_n):
+    """Delete the oldest non-protected checkpoint triples, keeping at most keep_last_n.
+
+    A checkpoint is "protected" if a sibling sentinel file model_<step>.pt.protected
+    exists. Use the `protect` flag on save_checkpoint to create that sentinel.
+    """
+    model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "model_*.pt")))
+    unprotected = [f for f in model_files if not os.path.exists(f + ".protected")]
+    n_to_delete = len(unprotected) - keep_last_n
+    if n_to_delete <= 0:
+        return
+    for f in unprotected[:n_to_delete]:
+        step_str = os.path.basename(f)[len("model_"):-len(".pt")]
+        for sibling in (
+            f"model_{step_str}.pt",
+            f"optim_{step_str}.pt",
+            f"meta_{step_str}.json",
+        ):
+            target = os.path.join(checkpoint_dir, sibling)
+            if os.path.exists(target):
+                os.remove(target)
+                log0(f"Pruned old checkpoint file: {target}")
+
+
+def _write_checkpoint_worker(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect, keep_last_n):
+    """Background-thread worker: serializes CPU tensors and optionally prunes."""
+    global _save_error
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+        _atomic_torch_save(model_cpu, model_path)
+        log0(f"Saved model file to: {model_path}")
+        if optim_cpu is not None:
+            optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
+            _atomic_torch_save(optim_cpu, optimizer_path)
+            log0(f"Saved optimizer file to: {optimizer_path}")
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        tmp_meta = meta_path + ".tmp"
+        with open(tmp_meta, "w") as f:
+            json.dump(meta_data, f, indent=2)
+        os.replace(tmp_meta, meta_path)
+        log0(f"Saved metadata file to: {meta_path}")
+        if protect:
+            # Sentinel: signals "do not delete during keep_last_n pruning".
+            open(model_path + ".protected", "w").close()
+        if keep_last_n is not None and keep_last_n > 0:
+            _prune_old_checkpoints(checkpoint_dir, keep_last_n)
+    except Exception as e:
+        _save_error = e
+        log0(f"Async checkpoint save failed at step {step}: {e!r}")
+        raise
+
+
+def wait_for_checkpoint():
+    """Block until the in-flight async checkpoint save (if any) has finished.
+
+    Call before process exit (after the last save_checkpoint call) so the
+    final checkpoint is fully flushed to disk before compute_cleanup tears
+    down the runtime. Also re-raises any exception the writer thread hit.
+    """
+    global _save_thread, _save_error
+    if _save_thread is not None:
+        if _save_thread.is_alive():
+            log0("Waiting for in-flight checkpoint save to finish...")
+        _save_thread.join()
+        _save_thread = None
+    if _save_error is not None:
+        err, _save_error = _save_error, None
+        raise err
+
+
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
+                    protect=False, keep_last_n=None):
+    """Async checkpoint save.
+
+    The state_dicts are cloned to CPU synchronously (so training can safely
+    continue without races against the next optimizer step), then the actual
+    disk write happens on a background thread. Only one in-flight save is
+    permitted; subsequent calls join on the previous thread before starting
+    a new CPU copy.
+
+    Args:
+        protect: if True, mark this checkpoint so it survives keep_last_n
+            pruning. Use for "important" saves: warmdown start, final step,
+            and resume points.
+        keep_last_n: if set, after this save the oldest non-protected
+            checkpoints in checkpoint_dir are deleted so only the most
+            recent keep_last_n remain.
+    """
+    assert int(os.environ.get('RANK', 0)) == 0  # prevent footguns for now
+    global _save_thread
+    # Ensure the previous save has finished before starting another. Keeps
+    # CPU memory bounded and serializes disk access.
+    wait_for_checkpoint()
+    # Synchronous: clone state to CPU. This is what blocks the training loop.
+    # PCIe DtoH is fast (~10 GB/s) compared to the subsequent disk write.
+    model_cpu = _to_cpu_state(model_data)
+    optim_cpu = _to_cpu_state(optimizer_data) if optimizer_data is not None else None
+    _save_thread = threading.Thread(
+        target=_write_checkpoint_worker,
+        args=(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect, keep_last_n),
+        daemon=False,
+    )
+    _save_thread.start()
 
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
