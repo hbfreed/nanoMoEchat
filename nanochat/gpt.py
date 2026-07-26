@@ -202,8 +202,16 @@ class MoEMLP(nn.Module):
         # need this for megablocks ops
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
 
+        # The transpose sort orders column-BLOCK indices, whose range is the
+        # number of column-blocks (total_expert_width / block_size), NOT
+        # num_experts. Sizing this to num_experts silently drops high bits
+        # whenever an expert spans more than one 128-block -- e.g. the default
+        # 64 experts x 256 needs 7 bits (128 column blocks) but got 6 -- which
+        # mis-groups the transpose and corrupts w1/w2 gradients. Forward and
+        # x.grad stay correct, so it is invisible: the loss still goes down and
+        # only the experts train wrong. Matches upstream megablocks dmoe.py.
         self.transpose_sort_end_bit = max(
-            int(math.ceil(math.log2(self.num_experts))), 1
+            int(math.ceil(math.log2(self.total_expert_width // self.block_size))), 1
         )
 
         # Register buffers for efficient CUDA kernel access
