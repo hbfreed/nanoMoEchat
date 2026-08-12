@@ -26,6 +26,8 @@ from cut_cross_entropy import linear_cross_entropy
 from einops import rearrange
 from megablocks import ops
 from megablocks.layers.relu_squared import relu_squared
+from megablocks.backend.fused_moe import FusedMoEPlan
+from megablocks.backend.grouped_moe import grouped_moe
 
 from nanochat.adamw import DistAdamW
 from nanochat.common import COMPUTE_DTYPE, get_dist_info, print0
@@ -49,6 +51,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     window_pattern: str = "SSSL"
     use_moe: bool = True
+    # "relu2": non-gated w1/w2 MLP with relu(x)^2, trained via the stk
+    # block-sparse path. "swiglu": gated w1(gate)/w3(up)/w2(down) MLP, trained
+    # via megablocks' pure-Triton grouped path (no compiled extensions).
+    mlp_act: str = "relu2"
     expert_sizes: list = field(
         default_factory=lambda: [(64, 256)]
     )  # 64 fine-grained experts
@@ -193,11 +199,22 @@ class MoEMLP(nn.Module):
 
         self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
 
+        self.mlp_act = config.mlp_act
+        assert self.mlp_act in ("relu2", "swiglu"), config.mlp_act
         self.w1 = nn.Parameter(torch.empty(config.n_embd, self.total_expert_width))
         self.w2 = nn.Parameter(torch.empty(self.total_expert_width, config.n_embd))
-
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        if self.mlp_act == "swiglu":
+            # llama naming: w1 = gate, w3 = up, w2 = down
+            self.w3 = nn.Parameter(
+                torch.empty(config.n_embd, self.total_expert_width)
+            )
+            nn.init.trunc_normal_(self.w3, mean=0.0, std=0.02, a=-0.06, b=0.06)
+            # Static per-module plan for the grouped kernels; built lazily on
+            # first forward (needs the device). Not a buffer -- it holds
+            # routing scratch, not state.
+            self._grouped_plan = None
 
         # need this for megablocks ops
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
@@ -273,6 +290,19 @@ class MoEMLP(nn.Module):
                 torch.empty(0, dtype=torch.long),
                 persistent=False,
             )
+
+    def init_params(self):
+        """Reinitialize the raw expert weight Parameters after to_empty.
+
+        GPT._init_weights only matches nn.Linear / nn.Embedding, so these
+        raw Parameters were left at to_empty garbage -- in practice zeros,
+        which is a fixed point of the gradient for both activations (dead
+        experts). Mirrors the trunc_normal init in __init__.
+        """
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        if self.mlp_act == "swiglu":
+            nn.init.trunc_normal_(self.w3, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
     def _init_buffers(self):
         """Reinitialize non-persistent buffers after to_empty from meta device."""
@@ -368,9 +398,16 @@ class MoEMLP(nn.Module):
         top_k_weights_flat = rearrange(top_k_weights, "... -> (...)")
         selected_experts_flat = rearrange(selected_experts, "... -> (...)")
 
-        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
-            selected_experts_flat
-        )
+        if self.mlp_act == "swiglu":
+            # The grouped path does its own counting-sort routing internally;
+            # only the per-expert counts are needed here (SMEBU + logging).
+            tokens_per_expert = ops.histogram(
+                selected_experts_flat, self.num_experts
+            )
+        else:
+            bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
+                selected_experts_flat
+            )
 
         if self.use_bias_balancing and self.training:
             with torch.no_grad():
@@ -403,27 +440,44 @@ class MoEMLP(nn.Module):
                 # 6. Apply
                 self.expert_bias += self.expert_bias_momentum
 
-        # Compute bins for gather/scatter
-        bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
+        if self.mlp_act == "swiglu":
+            if self._grouped_plan is None:
+                self._grouped_plan = FusedMoEPlan(
+                    self.expert_widths, x_flat.shape[-1], x_flat.device,
+                    block_n=self.block_size,
+                )
+            x_permuted = grouped_moe(
+                x_flat,
+                top_k_weights_flat,
+                selected_experts_flat.int(),
+                self._grouped_plan,
+                self.num_active_experts,
+                self.w1,
+                self.w3,
+                self.w2,
+            )
+        else:
+            # Compute bins for gather/scatter
+            bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
 
-        # Build topology dynamically each forward (like dMoE)
-        padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
+            # Build topology dynamically each forward (like dMoE)
+            padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
 
-        x_permuted = ops.padded_gather(
-            x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
-        )
-        x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
-        x_permuted = relu_squared(x_permuted)
-        x_permuted = stk.ops.dsd(x_permuted, self.w2)
-        x_permuted = ops.padded_scatter(
-            x_permuted,
-            indices,
-            bin_ids,
-            top_k_weights_flat,
-            bins,
-            padded_bins,
-            self.num_active_experts,
-        )
+            x_permuted = ops.padded_gather(
+                x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
+            )
+            x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
+            x_permuted = relu_squared(x_permuted)
+            x_permuted = stk.ops.dsd(x_permuted, self.w2)
+            x_permuted = ops.padded_scatter(
+                x_permuted,
+                indices,
+                bin_ids,
+                top_k_weights_flat,
+                bins,
+                padded_bins,
+                self.num_active_experts,
+            )
         output = rearrange(
             x_permuted,
             "(batch_size seq_len) n_embd -> batch_size seq_len n_embd",
@@ -706,10 +760,16 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Reinitialize MoE buffers lost during meta device -> to_empty
+        # Reinitialize MoE buffers AND raw expert weight Parameters lost
+        # during meta device -> to_empty (w1/w2/w3 are not nn.Linear, so
+        # self.apply(self._init_weights) never touches them; left at zero
+        # they are permanently dead -- zero is a fixed point of both
+        # activations' gradients).
         for block in self.transformer.h:
             if hasattr(block.mlp, "_init_buffers"):
                 block.mlp._init_buffers()
+            if hasattr(block.mlp, "init_params"):
+                block.mlp.init_params()
         # Cast all floating-point params to compute dtype (bf16 on Ampere+)
         # Integer buffers (expert_block_counts etc.) are unaffected
         if self.transformer.wte.weight.device.type == "cuda":
@@ -768,8 +828,9 @@ class GPT(nn.Module):
                 count * size for count, size in self.config.expert_sizes
             )
             num_experts = sum(count for count, _ in self.config.expert_sizes)
+            mlp_mult = 3 if self.config.mlp_act == "swiglu" else 2
             moe_params = (
-                self.config.n_embd * total_expert_width * 2 * self.config.n_layer
+                self.config.n_embd * total_expert_width * mlp_mult * self.config.n_layer
             )
             inactive_moe = (
                 moe_params

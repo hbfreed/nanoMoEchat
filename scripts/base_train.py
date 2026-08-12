@@ -60,6 +60,13 @@ parser.add_argument("--num-kv-heads", type=int, default=-1, help="number of kv h
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context")
 # MoE routing
+parser.add_argument(
+    "--mlp-act",
+    type=str,
+    default="relu2",
+    choices=["relu2", "swiglu"],
+    help="expert MLP: relu2 (w1/w2, stk path) or swiglu (w1/w3/w2, grouped Triton path)",
+)
 parser.add_argument("--expert-sizes", type=json.loads, default=[(64, 256)], help="JSON list of [count, width] tuples, e.g. '[[64,256]]'")
 parser.add_argument("--num-active-experts", type=int, default=8, help="top-k experts per token")
 parser.add_argument("--load-balance-loss-weight", type=float, default=0.08, help="load balance loss weight")
@@ -175,6 +182,7 @@ model_config_kwargs = dict(
     n_embd=model_dim,
     window_pattern=args.window_pattern,
     expert_sizes=args.expert_sizes,
+    mlp_act=args.mlp_act,
     num_active_experts=args.num_active_experts,
     load_balance_loss_weight=args.load_balance_loss_weight,
     router_z_loss_weight=args.router_z_loss_weight,
@@ -195,7 +203,8 @@ total_params = sum(p.numel() for p in model.parameters())
 if model_config.use_moe:
     total_expert_width = sum(count * size for count, size in model_config.expert_sizes)
     num_experts = sum(count for count, _ in model_config.expert_sizes)
-    moe_params = model_dim * total_expert_width * 2 * num_layers
+    mlp_mult = 3 if model_config.mlp_act == "swiglu" else 2
+    moe_params = model_dim * total_expert_width * mlp_mult * num_layers
     inactive_moe = (
         moe_params * (num_experts - model_config.num_active_experts) // num_experts
     )
