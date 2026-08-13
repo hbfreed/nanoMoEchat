@@ -23,6 +23,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from cut_cross_entropy import linear_cross_entropy
+
+# CCE is its own fused Triton kernel; Dynamo must not trace into it. Under
+# torch 2.11 tracing reaches CCE's runtime torch-version check and dies on a
+# known Dynamo bug (platform.uname() -> "uname_result_base.__new__() takes 6
+# positional arguments but 7 were given"). A graph break at the loss boundary
+# costs nothing.
+linear_cross_entropy = torch.compiler.disable(linear_cross_entropy)
 from einops import rearrange
 from megablocks import ops
 from megablocks.layers.relu_squared import relu_squared

@@ -229,7 +229,9 @@ elif target_flops > 0:
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif target_param_data_ratio > 0:
     target_tokens = target_param_data_ratio * num_params
-    num_iterations = target_tokens // total_batch_size
+    # target_param_data_ratio is a float arg; floor-div of floats is a float
+    # and range() downstream rejects it
+    num_iterations = int(target_tokens // total_batch_size)
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
