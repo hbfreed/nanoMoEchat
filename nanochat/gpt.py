@@ -990,7 +990,13 @@ class GPT(nn.Module):
                 impl="cce_kahan_full_c",
             )
             loss = ce_loss
-            if combined_aux_loss is not None:
+            # Fold the weighted aux losses into the scalar training loss only.
+            # Under loss_reduction="none" the aux scalar would broadcast onto
+            # every token, polluting per-token consumers: evaluate_bpb was
+            # reporting CE+aux, with the aux burden differing BY CONFIG (the
+            # grouped LB loss sees different group structures), which breaks
+            # cross-config bpb comparisons. Per-token loss = per-token CE.
+            if combined_aux_loss is not None and loss_reduction != "none":
                 if self.config.load_balance_loss_weight > 0:
                     loss = (
                         loss
