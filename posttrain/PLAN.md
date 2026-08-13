@@ -16,7 +16,10 @@ self-teaching mean anything); DPO second (cheap, shapes register); OPSD last
 ## Shared prompt generation (feeds both DPO and OPSD)
 
 One generation pass over `Cooking-Corpus/data` chunks (HOLDOUTS EXCLUDED —
-see Contamination). For each sampled chunk, an LLM writes:
+see Contamination). Chunks are hash-partitioned into DISJOINT sft/dpo/opsd
+splits (~1500 each): the same chunk never feeds two phases, so distribution
+is shared but examples are not — the guard against compounding memorization
+on top of the 27 pretraining passes. For each sampled chunk, an LLM writes:
 
 - `question`: a natural user request answerable from the chunk (recipe
   request, technique question, "why does X happen" — vary the type).
@@ -28,10 +31,10 @@ see Contamination). For each sampled chunk, an LLM writes:
 
 Three sources, mixed ~20-30% cooking : 70-80% dolci in the SFT phase:
 
-1. **Transcript-mined QA (backbone, real data):** parse the labeled Cooking
-   Issues transcripts into (caller question -> Dave answer) conversation
-   pairs, keeping natural multi-turn exchanges. 68 episodes, zero generation
-   cost, authentic register.
+1. **Transcripts (demoted from backbone):** they are mostly Dave ranting
+   (magnificently) rather than clean QA -- they stay in the pretraining mix
+   where that register belongs; SFT gets at most a hand-filtered subset of
+   genuinely conversational exchanges.
 2. **DPO `chosen` reuse:** each generation request already yields
    (question, professional answer) -- that IS a supervised pair. One
    generation pass feeds SFT, DPO, and OPSD.

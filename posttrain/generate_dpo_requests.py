@@ -77,8 +77,14 @@ def main():
     with open(args.out, "w", encoding="utf-8") as out:
         for book, fname, text in chunks:
             rid = hashlib.md5(f"{book}/{fname}".encode()).hexdigest()[:12]
+            # Disjoint phase assignment by content hash: the same chunk never
+            # feeds more than one of SFT/DPO/OPSD. Distribution reuse across
+            # phases is the design; example reuse (on top of 27 pretraining
+            # passes) is how memorization compounds.
+            split = ("sft", "dpo", "opsd")[int(rid, 16) % 3]
             out.write(json.dumps({
                 "id": rid,
+                "split": split,
                 "book": book,
                 "chunk": fname,
                 "passage": text,
