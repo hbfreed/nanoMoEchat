@@ -286,6 +286,21 @@ build_val_loader = lambda: tokenizing_distributed_data_loader(
 )
 x, y = next(train_loader)  # kick off load of the very first batch of data
 
+# On resume, fast-forward the data stream to the checkpoint's position: the
+# loader is a deterministic walk over sorted parquet shards (rank-striped), so
+# draining the same number of micro-batches reproduces it exactly. Without
+# this, a resumed run silently retrains on data from stream position zero --
+# including the heavily-repeated SPT mix shards -- and diverges from any
+# non-crashed twin run's data schedule.
+if args.resume_from_step > 0:
+    n_skip = args.resume_from_step * grad_accum_steps
+    print0(f"Fast-forwarding data stream: draining {n_skip:,} micro-batches...")
+    t0 = time.time()
+    for _ in range(n_skip - 1):
+        next(train_loader)
+    x, y = next(train_loader)
+    print0(f"Fast-forward done in {time.time() - t0:.1f}s")
+
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
