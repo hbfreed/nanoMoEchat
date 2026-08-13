@@ -503,6 +503,24 @@ for step in range(start_step, num_iterations + 1):
             if "expert_usage" in combined_aux_loss:
                 for j, val in enumerate(combined_aux_loss["expert_usage"]):
                     log_dict[f"train/expert_usage_{j}"] = val.item()
+                # Width-class aggregates: with many experts the per-expert
+                # scalars are unreadable; these four numbers are the variable-
+                # width experiment. effective_width < mean width = the compute
+                # loss is tilting routing toward narrow experts.
+                usage = [v.item() for v in combined_aux_loss["expert_usage"]]
+                widths, idx = [], 0
+                for count, size in model_config.expert_sizes:
+                    widths += [size] * count
+                total_f = sum(usage) or 1.0
+                by_class = {}
+                for f_e, w_e in zip(usage, widths):
+                    by_class[w_e] = by_class.get(w_e, 0.0) + f_e
+                for w_e, share in sorted(by_class.items()):
+                    log_dict[f"train/width_share_{w_e}"] = share / total_f
+                eff_w = sum(f_e * w_e for f_e, w_e in zip(usage, widths)) / total_f
+                mean_w = sum(widths) / len(widths)
+                log_dict["train/effective_width"] = eff_w
+                log_dict["train/effective_compute_frac"] = eff_w / mean_w
             if step % 1000 == 0 and "expert_bias_per_layer" in combined_aux_loss:
                 for i, bias_vec in enumerate(combined_aux_loss["expert_bias_per_layer"]):
                     for j, val in enumerate(bias_vec):
