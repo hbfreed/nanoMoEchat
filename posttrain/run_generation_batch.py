@@ -28,9 +28,13 @@ API = "https://api.mistral.ai/v1"
 MODEL = "zai-glm-5-2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REQUESTS_PATH = os.path.join(HERE, "generation_requests.jsonl")
-BATCH_PATH = os.path.join(HERE, "out", "batch_input.jsonl")
-STATE_PATH = os.path.join(HERE, "out", "batch_state.json")
-RESULTS_PATH = os.path.join(HERE, "out", "batch_results.jsonl")
+# Override with BATCH_TAG=r2 etc. to run additional rounds through the same
+# submit/status/fetch machinery (fetch's split logic only applies to round 1).
+_TAG = os.environ.get("BATCH_TAG", "")
+_SUF = f"_{_TAG}" if _TAG else ""
+BATCH_PATH = os.path.join(HERE, "out", f"batch_input{_SUF}.jsonl")
+STATE_PATH = os.path.join(HERE, "out", f"batch_state{_SUF}.json")
+RESULTS_PATH = os.path.join(HERE, "out", f"batch_results{_SUF}.jsonl")
 
 
 def _key():
