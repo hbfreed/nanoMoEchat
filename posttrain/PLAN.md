@@ -26,6 +26,7 @@ on top of the 27 pretraining passes. For each sampled chunk, an LLM writes:
 - For **OPSD**: nothing else needed — the triple is
   `(question, chunk_text as privileged passage)`.
 - For **DPO**: `chosen` and `rejected` (see spec below).
+- For **Generation**, let's use https://docs.mistral.ai/models/zai-glm-5-2, using the *batch api* for cheaper generations. API key is in .env. 
 
 ## Cooking SFT dataset (mostly free)
 
@@ -96,6 +97,5 @@ Render everything with the chat special tokens via render_conversation.
 ## Status
 
 - [ ] Generation requests emitted (`generate_dpo_requests.py`)
-- [ ] Rejected/chosen generation pass (LLM backend: Henry's choice)
 - [ ] DPO script (small; reuse chat_sft plumbing)
 - [ ] OPSD script (adapt chat_rl rollouts + distill loss)
