@@ -24,6 +24,23 @@ see Contamination). For each sampled chunk, an LLM writes:
   `(question, chunk_text as privileged passage)`.
 - For **DPO**: `chosen` and `rejected` (see spec below).
 
+## Cooking SFT dataset (mostly free)
+
+Three sources, mixed ~20-30% cooking : 70-80% dolci in the SFT phase:
+
+1. **Transcript-mined QA (backbone, real data):** parse the labeled Cooking
+   Issues transcripts into (caller question -> Dave answer) conversation
+   pairs, keeping natural multi-turn exchanges. 68 episodes, zero generation
+   cost, authentic register.
+2. **DPO `chosen` reuse:** each generation request already yields
+   (question, professional answer) -- that IS a supervised pair. One
+   generation pass feeds SFT, DPO, and OPSD.
+3. **Multi-turn synthesis (small):** ~500 conversations extending grounded QA
+   with realistic follow-ups (substitutions, failure diagnosis). Single-turn-
+   only SFT makes brittle chat models.
+
+Render everything with the chat special tokens via render_conversation.
+
 ## DPO pair spec
 
 - `prompt`: the shared question, e.g. "Give me a recipe for braised short ribs."
