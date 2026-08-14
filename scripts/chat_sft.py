@@ -32,6 +32,7 @@ from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 from tasks.arc import ARC
 from tasks.common import TaskMixture
+from tasks.cooking import CookingSFT
 from tasks.customjson import CustomJSON
 from tasks.gsm8k import GSM8K
 from tasks.smoltalk import SmolTalk
@@ -95,6 +96,11 @@ train_ds = TaskMixture(
         GSM8K(subset="main", split="train"),
         SmolTalk(split="train", stop=10_000),
         CustomJSON(filepath=identity_conversations_filepath),
+        # Cooking SFT (hbfreed/cook-posttrain), repeated to land the mixture
+        # at roughly 20-25% cooking per posttrain/PLAN.md.
+        CookingSFT(),
+        CookingSFT(),
+        CookingSFT(),
     ]
 )
 val_ds = SmolTalk(split="test")
