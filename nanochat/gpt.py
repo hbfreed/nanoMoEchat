@@ -448,7 +448,14 @@ class MoEMLP(nn.Module):
                 self.expert_bias += self.expert_bias_momentum
 
         if self.mlp_act == "swiglu":
-            if self._grouped_plan is None:
+            # A plan cached under torch.inference_mode() holds inference tensors
+            # whose in-place scratch updates are illegal outside it (and vice
+            # versa), so rebuild whenever the mode changed since it was built.
+            if (
+                self._grouped_plan is None
+                or self._grouped_plan.counts.is_inference()
+                != torch.is_inference_mode_enabled()
+            ):
                 self._grouped_plan = FusedMoEPlan(
                     self.expert_widths, x_flat.shape[-1], x_flat.device,
                     block_n=self.block_size,
