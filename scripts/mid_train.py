@@ -11,6 +11,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train
 
 import os
 from collections import deque
+from dataclasses import asdict
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -261,12 +262,9 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb,
                 "model_config": {
+                    **asdict(model.config),
                     "sequence_len": max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
                 },
                 "user_config": user_config,
             },
