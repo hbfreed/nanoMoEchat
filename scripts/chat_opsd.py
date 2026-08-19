@@ -30,6 +30,7 @@ import wandb
 from huggingface_hub import hf_hub_download
 
 from nanochat.checkpoint_manager import load_model, save_checkpoint, wait_for_checkpoint
+from tasks.cooking import clean_chunk
 from nanochat.common import (
     DummyWandb,
     autodetect_device_type,
@@ -103,7 +104,9 @@ with open(opsd_path, encoding="utf-8") as f:
         student_prefix = tokenizer.render_for_completion(
             {"messages": [{"role": "user", "content": row["question"]}, dummy]}
         )
-        passage_ids = tokenizer.encode(row["passage"])[: args.max_passage_tokens]
+        # Clean conversion artifacts so the teacher sees prose, not raw ebook
+        # markdown — raw chunks flip the model into document-continuation mode.
+        passage_ids = tokenizer.encode(clean_chunk(row["passage"]))[: args.max_passage_tokens]
         passage = tokenizer.decode(passage_ids)
         teacher_content = (
             row["question"]

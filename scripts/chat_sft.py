@@ -32,7 +32,7 @@ from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 from tasks.arc import ARC
 from tasks.common import TaskMixture
-from tasks.cooking import CookingSFT
+from tasks.cooking import CookingSFT, CookingOpenBook
 from tasks.customjson import CustomJSON
 from tasks.gsm8k import GSM8K
 from tasks.smoltalk import SmolTalk
@@ -101,6 +101,9 @@ train_ds = TaskMixture(
         CookingSFT(),
         CookingSFT(),
         CookingSFT(),
+        # Open-book QA: question + cleaned source passage in the user turn,
+        # so the OPSD teacher prompt is in-distribution (see tasks/cooking.py).
+        CookingOpenBook(),
     ]
 )
 val_ds = SmolTalk(split="test")
