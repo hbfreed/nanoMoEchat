@@ -103,6 +103,9 @@ train_ds = TaskMixture(
         CookingSFT(),
         # Open-book QA: question + cleaned source passage in the user turn,
         # so the OPSD teacher prompt is in-distribution (see tasks/cooking.py).
+        # Weighted 3x: the v2 teacher only grounded ~2/5 open-book answers.
+        CookingOpenBook(),
+        CookingOpenBook(),
         CookingOpenBook(),
     ]
 )
