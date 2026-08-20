@@ -23,7 +23,7 @@ echo "=== [2/5] DPO (dpo-cook-3) ==="
 CUDA_VISIBLE_DEVICES=0 $PY -m scripts.chat_dpo --source=sft --model-tag=d20 --run=dpo-cook-3 --init-lr-frac=0.01 --num-epochs=3
 
 echo "=== [3/5] OPSD (opsd-cook-2) ==="
-torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd -- --source=dpo --model-tag=d20 --run=opsd-cook-2
+.venv/bin/torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd -- --source=dpo --model-tag=d20 --run=opsd-cook-2
 
 echo "=== [4/5] Dashboard on final model ==="
 CUDA_VISIBLE_DEVICES=0 $PY -m scripts.sft_dashboard --source=rl --model-tag=d20 --max-tokens=640
