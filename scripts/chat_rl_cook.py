@@ -42,6 +42,7 @@ parser.add_argument("--num-epochs", type=int, default=1)
 parser.add_argument("--save-every", type=int, default=30)
 parser.add_argument("--eval-every", type=int, default=30)
 parser.add_argument("--eval-examples", type=int, default=32)
+parser.add_argument("--judge-mode", type=str, default="rank", choices=["rank", "pair"])
 args = parser.parse_args()
 user_config = vars(args).copy()
 
@@ -63,7 +64,7 @@ temperature = args.temperature
 top_k = args.top_k
 
 # Last 10% of prompts held out for eval; never trained.
-full_task = CookingRL(seed=1234 + ddp_rank)
+full_task = CookingRL(seed=1234 + ddp_rank, judge_mode=args.judge_mode)
 split = int(full_task.num_examples() * 0.9)
 train_indices = list(range(split))
 val_indices = list(range(split, full_task.num_examples()))
@@ -192,7 +193,10 @@ for step in range(num_steps):
     model.zero_grad(set_to_none=True)
 
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
-        checkpoint_dir = os.path.join(get_base_dir(), "chatrlvr_checkpoints", f"d{model.config.n_layer}")
+        checkpoint_dir = os.path.join(
+            get_base_dir(), "chatrlvr_checkpoints",
+            f"d{model.config.n_layer}-{args.judge_mode}",
+        )
         save_checkpoint(checkpoint_dir, step, model.state_dict(), None,
                         {"model_config": model.config.__dict__})
         print(f"Saved model checkpoint to {checkpoint_dir}")
