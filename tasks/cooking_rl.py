@@ -127,11 +127,60 @@ def rank_group(question, candidates, reference, rng, timeout=120):
     return [score_by_item[i] for i in range(len(candidates))], score_by_item[len(items) - 1]
 
 
-class CookingRL(Task):
-    """Prompts from the DPO split; reward = gates x (0.3 flavor + 0.7 judge)."""
+def _pair_one(question, cand, reference, flip, timeout):
+    a, b = (cand, reference) if not flip else (reference, cand)
+    prompt = (
+        "You are judging two answers to a cooking question. Prefer the "
+        "answer with real quantities, a coherent method, plausible flavor "
+        "pairings, and no rambling or repetition.\n\n"
+        f"QUESTION: {question}\n\n=== ANSWER A ===\n{a[:1800]}\n\n"
+        f"=== ANSWER B ===\n{b[:1800]}\n\n"
+        "Reply with exactly one letter: A or B."
+    )
+    try:
+        r = requests.post(_JUDGE_URL, timeout=timeout, json={
+            "model": _JUDGE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 4, "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        })
+        out = r.json()["choices"][0]["message"]["content"].strip().upper()
+        if out[:1] not in ("A", "B"):
+            raise ValueError(out)
+        return 1.0 if (out[:1] == "A") != flip else 0.0
+    except Exception:
+        return 0.5
 
-    def __init__(self, seed=0, **kwargs):
+
+def pair_wins(question, candidates, reference, rng, timeout=120):
+    """Pairwise arm: each candidate vs the reference, calls run concurrently
+    against the judge server's parallel slots.
+
+    Returns (scores, ref_score) with the same shape as rank_group; scores
+    are 0/1 wins (0.5 on judge failure), ref_score = 1 - mean(win rate)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    flips = [rng.random() < 0.5 for _ in candidates]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        scores = list(pool.map(
+            lambda cf: _pair_one(question, cf[0], reference, cf[1], timeout),
+            zip(candidates, flips),
+        ))
+    valid = [s for s in scores if s != 0.5]
+    ref_score = 1.0 - (sum(valid) / len(valid)) if valid else 0.5
+    return scores, ref_score
+
+
+class CookingRL(Task):
+    """Prompts from the DPO split; reward = gates x (0.3 flavor + 0.7 judge).
+
+    judge_mode: "rank" (one call ranks the whole group + unmarked reference)
+    or "pair" (one call per rollout vs the reference)."""
+
+    def __init__(self, seed=0, judge_mode="rank", **kwargs):
         super().__init__(**kwargs)
+        assert judge_mode in ("rank", "pair")
+        self.judge_mode = judge_mode
         self.rng = random.Random(seed)
         self.rows = []
         with open(_PAIRS, encoding="utf-8") as f:
@@ -171,7 +220,8 @@ class CookingRL(Task):
         reference landed among the rollouts (0.5 = judge failure)."""
         question = conversation["messages"][0]["content"]
         texts = [t.strip() for t in texts]
-        ranks, ref_score = rank_group(
+        judge = rank_group if self.judge_mode == "rank" else pair_wins
+        ranks, ref_score = judge(
             question, texts, conversation["_reference"], self.rng
         )
         rewards = [
