@@ -19,6 +19,7 @@ import time
 import argparse
 
 import torch
+import torch.distributed as dist
 
 import wandb
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, wait_for_checkpoint
@@ -39,6 +40,7 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import USE_FA3, HAS_FA3
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.loss_eval import evaluate_bpb
+from nanochat.muon import DistMuon
 from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_model
 
@@ -250,6 +252,30 @@ optimizers = model.setup_optimizers(
 )
 adamw_optimizer, muon_optimizer = optimizers
 
+# setup_optimizers only uses the sharded DistMuon/DistAdamW (which reduce-scatter grads
+# themselves) for power-of-2 world sizes. Otherwise nothing syncs grads and each rank
+# silently trains its own model, so average them before stepping.
+sync_grads = ddp and not isinstance(muon_optimizer, DistMuon)
+# SMEBU expert biases update from each rank's local token counts, so they drift apart
+# across ranks under any multi-GPU setup; average them after every step.
+expert_bias_buffers = [
+    b for name, b in orig_model.named_buffers()
+    if name.endswith(("expert_bias", "expert_bias_momentum"))
+]
+
+
+def all_reduce_avg_(tensors):
+    """Average same-dtype tensors across ranks in place, with a single collective."""
+    if not tensors:
+        return
+    flat = torch.cat([t.reshape(-1) for t in tensors])
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    offset = 0
+    for t in tensors:
+        t.copy_(flat[offset : offset + t.numel()].view_as(t))
+        offset += t.numel()
+
+
 # Resume from a previous checkpoint if requested (load model + optimizer state)
 base_dir = get_base_dir()
 start_step = 0
@@ -345,7 +371,7 @@ for step in range(start_step, num_iterations + 1):
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
+    if eval_every > 0 and (last_step or step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
@@ -384,7 +410,7 @@ for step in range(start_step, num_iterations + 1):
         model.train()
 
     # once in a while: sample from the model (only on master process)
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    if sample_every > 0 and master_process and (last_step or (step > 0 and step % sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -448,6 +474,11 @@ for step in range(start_step, num_iterations + 1):
         loss = loss / grad_accum_steps
         loss.backward()
         x, y = next(train_loader)
+    if sync_grads:
+        for p in model.parameters():
+            if p.grad is None:  # keep the flat buffer layout identical on every rank
+                p.grad = torch.zeros_like(p)
+        all_reduce_avg_([p.grad for p in model.parameters()])
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
@@ -459,6 +490,8 @@ for step in range(start_step, num_iterations + 1):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if ddp:
+        all_reduce_avg_(expert_bias_buffers)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
