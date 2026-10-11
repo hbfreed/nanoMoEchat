@@ -117,6 +117,7 @@ parser.add_argument("--tokenizer", type=str, default="", help="tokenizer dir und
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
 parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--profile-step", type=int, default=-1, help="profile this step: per-phase wall time and GPU time by kernel type (rank 0), plus a chrome trace in the checkpoint dir's parent")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
@@ -556,6 +557,11 @@ for step in range(start_step, num_iterations + 1):
 
     # -------------------------------------------------------------------------
     # single training step
+    profiling = step == args.profile_step
+    if profiling:
+        from torch.profiler import ProfilerActivity, profile
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        prof.__enter__()
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
@@ -569,6 +575,9 @@ for step in range(start_step, num_iterations + 1):
             if p.grad is None:  # keep the flat buffer layout identical on every rank
                 p.grad = torch.zeros_like(p)
         all_reduce_avg_([p.grad for p in model.parameters()])
+    if profiling:
+        synchronize()
+        t_fwdbwd = time.time()
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
@@ -587,6 +596,26 @@ for step in range(start_step, num_iterations + 1):
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    if profiling:
+        prof.__exit__(None, None, None)
+        if master_process:
+            kinds = {"comm (nccl)": ("nccl",), "attention": ("flash", "fmha"),
+                     "matmul": ("gemm", "cutlass", "s16816", "s1688", "xmma", "matmul")}
+            by_kind = {}
+            for e in prof.key_averages():
+                t = getattr(e, "device_time_total", 0)
+                if t <= 0:
+                    continue
+                k = next((k for k, pats in kinds.items() if any(x in e.key.lower() for x in pats)), "other")
+                by_kind[k] = by_kind.get(k, 0) + t / 1e3
+            print0(f"PROFILE step {step}: wall {dt*1e3:.0f} ms = fwd+bwd {1e3*(t_fwdbwd-t0):.0f} ms "
+                   f"+ optimizer/sync {1e3*(t1-t_fwdbwd):.0f} ms | GPU time (kernels may overlap): "
+                   + ", ".join(f"{k} {v:.0f} ms" for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1])))
+            for e in sorted(prof.key_averages(), key=lambda e: -getattr(e, "device_time_total", 0))[:15]:
+                print0(f"  {getattr(e, 'device_time_total', 0)/1e3:8.1f} ms  {e.key[:100]}")
+            trace = os.path.join(base_dir, f"profile_{model_tag or 'run'}_step{step}.json")
+            prof.export_chrome_trace(trace)
+            print0(f"PROFILE trace: {trace}")
     # -------------------------------------------------------------------------
 
     # logging
