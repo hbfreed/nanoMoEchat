@@ -47,3 +47,61 @@ def tokenizing_distributed_data_loader(B, T, split, tokenizer_threads=4, tokeniz
         inputs = inputs_cpu.view(B, T).to(device=device, dtype=torch.int32, non_blocking=True)
         targets = targets_cpu.view(B, T).to(device=device, dtype=torch.int64, non_blocking=True)
         yield inputs, targets
+
+
+class TokenStream:
+    """The pre-tokenized shards of a split (scripts/pretokenize.py) as one contiguous,
+    memory-mapped token stream. Shards are taken in parquet order up to the first
+    one not yet tokenized, so a partially tokenized dataset is a usable prefix."""
+
+    def __init__(self, split, tokenizer_name=None):
+        import os
+        import numpy as np
+        from nanochat.common import get_base_dir
+        from nanochat.dataset import list_parquet_files
+        from nanochat.tokenizer import get_tokenizer, get_tokenizer_name
+        name = tokenizer_name or get_tokenizer_name()
+        token_dir = os.path.join(get_base_dir(), "tokens", name)
+        paths = list_parquet_files()
+        paths = paths[:-1] if split == "train" else paths[-1:]
+        dtype = np.uint16 if get_tokenizer(name).get_vocab_size() <= 2**16 else np.uint32
+        self.shards = []
+        for path in paths:
+            stem = os.path.join(token_dir, os.path.basename(path).removesuffix(".parquet"))
+            if not os.path.exists(stem + ".idx"):
+                break
+            self.shards.append(np.memmap(stem + ".bin", dtype=dtype, mode="r"))
+        assert self.shards, f"no pre-tokenized {split} shards in {token_dir}; run scripts/pretokenize.py"
+        self.ends = np.cumsum([len(s) for s in self.shards])
+        self.num_tokens = int(self.ends[-1])
+
+    def read(self, start, n):
+        """n tokens from stream position start (wrapping around at the end)."""
+        import numpy as np
+        out, filled = np.empty(n, dtype=np.int64), 0
+        while filled < n:
+            pos = (start + filled) % self.num_tokens
+            i = int(np.searchsorted(self.ends, pos, side="right"))
+            lo = pos - (int(self.ends[i - 1]) if i else 0)
+            take = min(n - filled, len(self.shards[i]) - lo)
+            out[filled : filled + take] = self.shards[i][lo : lo + take]
+            filled += take
+        return out
+
+
+def pretokenized_data_loader(B, T, split, device="cuda", start_micro_step=0, tokenizer_name=None):
+    """Like tokenizing_distributed_data_loader, from the pre-tokenized stream. Micro-step m
+    on rank r reads the B*T(+1 target) tokens at ((m * world_size + r) * B*T), so the data
+    order is a pure function of the step: resuming starts at start_micro_step directly."""
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    stream = TokenStream(split, tokenizer_name)
+    n = B * T
+    m = start_micro_step
+    while True:
+        tokens = torch.from_numpy(stream.read((m * ddp_world_size + ddp_rank) * n, n + 1))
+        if device == "cuda":
+            tokens = tokens.pin_memory()
+        inputs = tokens[:-1].view(B, T).to(device=device, dtype=torch.int32, non_blocking=True)
+        targets = tokens[1:].view(B, T).to(device=device, dtype=torch.int64, non_blocking=True)
+        yield inputs, targets
+        m += 1

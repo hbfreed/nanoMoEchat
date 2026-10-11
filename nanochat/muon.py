@@ -196,3 +196,84 @@ class DistMuon(torch.optim.Optimizer):
 
         # Wait for all work to finish
         torch.futures.collect_all(all_gather_futures).wait()
+
+
+def _local(t: Tensor) -> Tensor:
+    """The local shard of an FSDP2 (DTensor) param or grad; plain tensors pass through."""
+    return t.to_local() if hasattr(t, "to_local") else t
+
+
+class FSDPMuon(torch.optim.Optimizer):
+    """
+    Muon for FSDP2 (fully_shard) params, which each rank holds as a dim-0 shard and
+    whose grads arrive already reduce-scattered. Same math as DistMuon:
+      - momentum / Nesterov on each rank's shard (elementwise, so shards are exact)
+      - per matrix, an owner rank (block-cyclic, as DistMuon) gathers the full
+        Nesterov gradient with an all_to_all, runs Newton-Schulz, and sends each
+        rank its rows of the update back with a second all_to_all
+      - each rank applies its rows to its shard
+    Momentum memory is sharded like the params. Shard sizes follow torch.chunk on dim 0,
+    as FSDP2 does, so uneven splits (e.g. dim 0 not divisible by 3) are handled.
+    """
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
+                 nesterov: bool = True, ns_steps: int = 5,
+                 stochastic_rounding: bool = False, state_dtype=None):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        self.stochastic_rounding = stochastic_rounding
+        self.state_dtype = state_dtype
+        params = list(params)
+        assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
+        shapes = sorted({tuple(p.shape) for p in params})
+        param_groups = [dict(params=[p for p in params if tuple(p.shape) == s]) for s in shapes]
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        # 1. momentum + Nesterov on local shards, then all_to_all the shards to each owner
+        pending = []
+        for group in self.param_groups:
+            params = group["params"]
+            # FSDP2 shards with torch.chunk, which can return fewer chunks; the rest are empty
+            rows = [c.size(0) for c in torch.empty(params[0].size(0)).chunk(world_size)]
+            rows += [0] * (world_size - len(rows))
+            cols = params[0].size(1)
+            for base_i in range(0, len(params), world_size):
+                chunk = params[base_i:base_i + world_size]
+                send = []
+                for p in chunk:
+                    g = _local(p.grad)
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
+                    buf = state["momentum_buffer"]
+                    buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
+                    g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf.to(g.dtype)
+                    send.append(g.contiguous())
+                dtype, device = send[0].dtype, send[0].device
+                send += [torch.empty(0, cols, dtype=dtype, device=device)] * (world_size - len(chunk))
+                owns = base_i + rank < len(params)
+                recv = [torch.empty(r if owns else 0, cols, dtype=dtype, device=device) for r in rows]
+                work = dist.all_to_all(recv, send, async_op=True)
+                pending.append((group, chunk, rows, recv, work))
+        # 2. owners orthogonalize, then all_to_all each rank its rows of the update
+        updates = []
+        for group, chunk, rows, recv, work in pending:
+            work.wait()
+            dtype, device, cols = recv[0].dtype, recv[0].device, recv[0].size(1)
+            if rank < len(chunk):
+                full = torch.cat(recv)
+                u = zeropower_via_newtonschulz5(full, steps=group["ns_steps"])
+                send = [s.contiguous() for s in u.split(rows)]
+            else:
+                send = [torch.empty(0, cols, dtype=dtype, device=device) for _ in rows]
+            recv_u = [torch.empty(rows[rank], cols, dtype=dtype, device=device) if j < len(chunk)
+                      else torch.empty(0, cols, dtype=dtype, device=device) for j in range(world_size)]
+            work = dist.all_to_all(recv_u, send, async_op=True)
+            updates.append((group, chunk, recv_u, work))
+        # 3. apply each rank's rows to its shards
+        for group, chunk, recv_u, work in updates:
+            work.wait()
+            for p, u in zip(chunk, recv_u):
+                scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+                apply_update_(_local(p), u, -group["lr"] * scale, self.stochastic_rounding)

@@ -68,7 +68,9 @@ class AdamW(torch.optim.Optimizer):
                     continue
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
                 wd_eff = lr * group['weight_decay'] * getattr(p, "wd_mul", 1.0)
-                _adamw_update_(p, p.grad, self.state[p], lr, beta1, beta2, group['eps'],
+                # FSDP2 params/grads are DTensors: step the local shard (elementwise, so exact)
+                p_, g_ = (p.to_local(), p.grad.to_local()) if hasattr(p, "to_local") else (p, p.grad)
+                _adamw_update_(p_, g_, self.state[p], lr, beta1, beta2, group['eps'],
                                wd_eff, self.stochastic_rounding, self.state_dtype)
 
 

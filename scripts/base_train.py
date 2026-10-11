@@ -35,12 +35,12 @@ from nanochat.common import (
     print0,
     print_banner,
 )
-from nanochat.dataloader import tokenizing_distributed_data_loader
+from nanochat.dataloader import TokenStream, pretokenized_data_loader, tokenizing_distributed_data_loader
 from nanochat.engine import Engine
 from nanochat.flash_attention import ATTN_IMPL
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.loss_eval import evaluate_bpb
-from nanochat.muon import DistMuon
+from nanochat.muon import DistMuon, FSDPMuon
 from nanochat.tokenizer import get_token_bytes, get_tokenizer, get_tokenizer_name
 from scripts.base_eval import evaluate_model
 
@@ -117,6 +117,8 @@ parser.add_argument("--tokenizer", type=str, default="", help="tokenizer dir und
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
 parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
+parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
 if args.tokenizer:  # get_tokenizer() everywhere, incl. the dataloaders, reads this
     os.environ["NANOCHAT_TOKENIZER"] = args.tokenizer
@@ -221,6 +223,16 @@ with torch.device("meta"):
     model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
+if args.fsdp:
+    # FSDP2: each block (and the root: embeddings, lm_head, final norm) is all-gathered
+    # for its forward/backward and resharded after; grads are reduce-scattered each
+    # backward. Buffers (expert biases) stay replicated.
+    from torch.distributed.fsdp import fully_shard
+    assert ddp, "--fsdp needs torchrun with more than one rank"
+    assert not args.fp32_master_weights, "--fsdp with fp32 master weights is not supported yet"
+    for block in model.transformer.h:
+        fully_shard(block)
+    fully_shard(model)
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False)
 total_params = sum(p.numel() for p in model.parameters())
@@ -274,17 +286,23 @@ optimizers = model.setup_optimizers(
     stochastic_rounding=args.stochastic_rounding,
     optim_state_dtype=torch.bfloat16 if args.bf16_optim_state else None,
     norm_lr=args.norm_lr,
+    fsdp=args.fsdp,
 )
 adamw_optimizer, muon_optimizer = optimizers
 
 # setup_optimizers only uses the sharded DistMuon/DistAdamW (which reduce-scatter grads
 # themselves) for power-of-2 world sizes. Otherwise nothing syncs grads and each rank
 # silently trains its own model, so average them before stepping.
-sharded_optim = isinstance(muon_optimizer, DistMuon)
+sharded_optim = isinstance(muon_optimizer, (DistMuon, FSDPMuon))
 sync_grads = ddp and not sharded_optim
 # sharded optimizer state lives on every rank, so every rank saves/loads its own shard
 optim_shard_rank = ddp_rank if sharded_optim else None
-print0(f"Optimizers: {'sharded (DistMuon/DistAdamW)' if sharded_optim else 'replicated'}")
+print0(f"Optimizers: {'FSDP2 (FSDPMuon/AdamW on shards)' if args.fsdp else 'sharded (DistMuon/DistAdamW)' if sharded_optim else 'replicated'}")
+if args.fsdp:  # these run the model on rank 0 only, or compare replicas FSDP does not have
+    for flag in ("sample_every", "core_metric_every", "replica_check_every"):
+        if getattr(args, flag) > 0:
+            print0(f"--fsdp: disabling --{flag.replace('_', '-')} (not supported with FSDP yet)")
+            setattr(args, flag, -1)
 # SMEBU expert biases update from each rank's local token counts, so they drift apart
 # across ranks under any multi-GPU setup; average them after every step.
 expert_bias_buffers = [
@@ -334,7 +352,11 @@ if args.resume_from_step != -1:
     model_data = {k.lstrip("_orig_mod."): v for k, v in model_data.items()}
     # assign=False (in-place copy) so optimizer's param references stay valid.
     # assign=True would swap the tensors, orphaning Muon's stored param refs.
-    orig_model.load_state_dict(model_data, strict=True, assign=False)
+    if args.fsdp:  # every rank loaded the full state; each keeps its shards
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+        set_model_state_dict(orig_model, model_data, options=StateDictOptions(full_state_dict=True))
+    else:
+        orig_model.load_state_dict(model_data, strict=True, assign=False)
     assert isinstance(optimizer_data, list) and len(optimizer_data) == 2, \
         "expected a 2-element list [adamw_state, muon_state]"
     adamw_optimizer.load_state_dict(optimizer_data[0])
@@ -348,21 +370,36 @@ if args.resume_from_step != -1:
             open(resume_model_path + ".protected", "w").close()
 
 # Initialize the DataLoaders for train/val
-train_loader = tokenizing_distributed_data_loader(
-    device_batch_size, max_seq_len, split="train", device=device
-)
-build_val_loader = lambda: tokenizing_distributed_data_loader(
-    device_batch_size, max_seq_len, split="val", device=device
-)
-x, y = next(train_loader)  # kick off load of the very first batch of data
+if args.pretokenized:
+    start_micro = max(args.resume_from_step, 0) * grad_accum_steps
+    train_loader = pretokenized_data_loader(
+        device_batch_size, max_seq_len, split="train", device=device, start_micro_step=start_micro
+    )
+    build_val_loader = lambda: pretokenized_data_loader(
+        device_batch_size, max_seq_len, split="val", device=device
+    )
+    train_stream = TokenStream("train")
+    tokens_needed = num_iterations * total_batch_size
+    print0(f"Pre-tokenized train stream: {train_stream.num_tokens/1e9:.2f}B tokens in "
+           f"{len(train_stream.shards)} shards; this run reads {tokens_needed/1e9:.2f}B"
+           + (" (WRAPS AROUND: repeats data)" if tokens_needed > train_stream.num_tokens else ""))
+    x, y = next(train_loader)
+else:
+    train_loader = tokenizing_distributed_data_loader(
+        device_batch_size, max_seq_len, split="train", device=device
+    )
+    build_val_loader = lambda: tokenizing_distributed_data_loader(
+        device_batch_size, max_seq_len, split="val", device=device
+    )
+    x, y = next(train_loader)  # kick off load of the very first batch of data
 
 # On resume, fast-forward the data stream to the checkpoint's position: the
 # loader is a deterministic walk over sorted parquet shards (rank-striped), so
 # draining the same number of micro-batches reproduces it exactly. Without
 # this, a resumed run silently retrains on data from stream position zero --
 # including the heavily-repeated SPT mix shards -- and diverges from any
-# non-crashed twin run's data schedule.
-if args.resume_from_step > 0:
+# non-crashed twin run's data schedule. (The pre-tokenized loader starts there.)
+if args.resume_from_step > 0 and not args.pretokenized:
     n_skip = args.resume_from_step * grad_accum_steps
     print0(f"Fast-forwarding data stream: draining {n_skip:,} micro-batches...")
     t0 = time.time()
@@ -489,10 +526,16 @@ for step in range(start_step, num_iterations + 1):
         # the final step.
         protect = at_warmdown_start or last_step
         keep_last_n = args.keep_last_n if args.keep_last_n > 0 else None
+        if args.fsdp:  # collective: every rank sends its shards, rank 0 gets the full state
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+            model_state = get_model_state_dict(
+                orig_model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+        else:
+            model_state = orig_model.state_dict() if master_process else None
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict() if master_process else None,
+            model_state if master_process else None,
             [opt.state_dict() for opt in optimizers],
             {
                 "step": step,

@@ -68,7 +68,7 @@ from megablocks.backend.grouped_moe import grouped_moe
 from nanochat.adamw import AdamW, DistAdamW
 from nanochat.common import COMPUTE_DTYPE, get_dist_info, print0
 from nanochat.flash_attention import flash_attn
-from nanochat.muon import DistMuon, Muon
+from nanochat.muon import DistMuon, FSDPMuon, Muon
 from nanochat.topology_var import topology_var
 
 # Keys in aux_loss that should be aggregated with max across layers, not mean
@@ -1007,9 +1007,11 @@ class GPT(nn.Module):
 
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
-        stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004,
+        stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004, fsdp=False,
     ):
         """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
+        fsdp: params are FSDP2-sharded (fully_shard); AdamW steps each rank's shards and
+        FSDPMuon gathers each matrix to an owner rank for Newton-Schulz.
         stochastic_rounding: stochastically round bf16 weight updates.
         optim_state_dtype: dtype for momentum / Adam moments (default: the param's)."""
         model_dim = self.config.n_embd
@@ -1047,7 +1049,9 @@ class GPT(nn.Module):
         precision_kwargs = dict(
             stochastic_rounding=stochastic_rounding, state_dtype=optim_state_dtype
         )
-        if use_sharded:
+        if fsdp:
+            adamw_optimizer = AdamW(adam_groups, **adamw_kwargs, **precision_kwargs)
+        elif use_sharded:
             adamw_optimizer = DistAdamW(adam_groups, **adamw_kwargs, **precision_kwargs)
         elif stochastic_rounding or optim_state_dtype is not None:
             adamw_optimizer = AdamW(adam_groups, **adamw_kwargs, **precision_kwargs)
@@ -1055,7 +1059,7 @@ class GPT(nn.Module):
             adamw_optimizer = torch.optim.AdamW(adam_groups, **adamw_kwargs, fused=True)
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, **precision_kwargs)
-        MuonFactory = DistMuon if use_sharded else Muon
+        MuonFactory = FSDPMuon if fsdp else DistMuon if use_sharded else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
