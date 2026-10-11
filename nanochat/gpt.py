@@ -852,14 +852,27 @@ class Block(nn.Module):
         return self._forward(x, cos_sin, window_size, kv_cache)
 
     def _forward(self, x, cos_sin, window_size, kv_cache):
+        x, h = self._attn_sublayer(x, cos_sin, window_size, kv_cache)
+        mlp_x, aux_loss, f_i = self.mlp(h)
+        return self._mlp_residual(x, mlp_x), aux_loss, f_i
+
+    # The MLP sits between these two because MoEMLP.forward is torch.compiler.disable'd:
+    # compile_pieces() compiles them separately, so a checkpointed block still runs
+    # compiled code (Dynamo cannot compile a checkpointed region with a graph break inside)
+    def _attn_sublayer(self, x, cos_sin, window_size, kv_cache):
+        """Attention residual; returns (x, normed MLP input)."""
         if self.afmoe:
             x = x + self.post_attn_norm(self.attn(self.input_norm(x), cos_sin, window_size, kv_cache))
-            mlp_x, aux_loss, f_i = self.mlp(self.pre_mlp_norm(x))
-            return x + self.post_mlp_norm(mlp_x), aux_loss, f_i
+            return x, self.pre_mlp_norm(x)
         x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        mlp_x, aux_loss, f_i = self.mlp(norm(x))
-        x = x + mlp_x
-        return x, aux_loss, f_i
+        return x, norm(x)
+
+    def _mlp_residual(self, x, mlp_x):
+        return x + (self.post_mlp_norm(mlp_x) if self.afmoe else mlp_x)
+
+    def compile_pieces(self):
+        self._attn_sublayer = torch.compile(self._attn_sublayer, dynamic=False)
+        self._mlp_residual = torch.compile(self._mlp_residual, dynamic=False)
 
 
 class GPT(nn.Module):
@@ -1049,11 +1062,12 @@ class GPT(nn.Module):
                     layouts[getattr(mlp, name)] = (dim, width)
         return layouts
 
-    def set_activation_checkpointing(self, enabled=True):
-        """Recompute each block in backward. With bias balancing, call
-        set_defer_bias_updates() too, so recompute routes exactly like the forward."""
-        for block in self.transformer.h:
-            block.activation_checkpointing = enabled
+    def set_activation_checkpointing(self, enabled=True, num_layers=None):
+        """Recompute blocks in backward (the first num_layers, default all). With bias
+        balancing, call set_defer_bias_updates() too, so recompute routes like the forward."""
+        n = len(self.transformer.h) if num_layers is None else num_layers
+        for i, block in enumerate(self.transformer.h):
+            block.activation_checkpointing = enabled and i < n
 
     def bias_balanced_mlps(self):
         return [b.mlp for b in self.transformer.h if getattr(b.mlp, "use_bias_balancing", False)]

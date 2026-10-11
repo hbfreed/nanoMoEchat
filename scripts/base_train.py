@@ -120,6 +120,7 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 parser.add_argument("--profile-step", type=int, default=-1, help="profile this step: per-phase wall time and GPU time by kernel type (rank 0), plus a chrome trace in the checkpoint dir's parent")
 parser.add_argument("--muon-per-expert", action="store_true", help="Muon orthogonalizes each MoE expert's matrices separately (with --fsdp, experts are sharded whole, so no optimizer communication)")
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to fit bigger micro-batches")
+parser.add_argument("--checkpoint-layers", type=int, default=-1, help="with --activation-checkpointing: checkpoint only the first N blocks (-1: all), trading memory for less recompute")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
@@ -230,7 +231,7 @@ model.init_weights()
 # so routing is fixed within a step and the bias is identical on every rank
 model.set_defer_bias_updates(True)
 if args.activation_checkpointing:
-    model.set_activation_checkpointing(True)
+    model.set_activation_checkpointing(True, None if args.checkpoint_layers < 0 else args.checkpoint_layers)
 if args.fsdp:
     # FSDP2: each block (and the root: embeddings, lm_head, final norm) is all-gathered
     # for its forward/backward and resharded after; grads are reduce-scattered each
@@ -246,8 +247,16 @@ if args.fsdp:
     for block in model.transformer.h:
         fully_shard(block, shard_placement_fn=placement)
     fully_shard(model)
+    del layouts, placement  # they reference the unsharded params; keeping them keeps a full copy alive
+    print0(f"FSDP: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated per rank after sharding")
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False)
+if args.fsdp or args.activation_checkpointing:
+    # compiling the root graph-breaks at every FSDP2 hook and at the (compile-disabled)
+    # MoE inside each checkpointed block, leaving blocks eager: compile the pieces instead
+    for block in orig_model.transformer.h:
+        block.compile_pieces()
+else:
+    model = torch.compile(model, dynamic=False)
 total_params = sum(p.numel() for p in model.parameters())
 if model_config.use_moe:
     total_expert_width = sum(count * size for count, size in model_config.expert_sizes)
@@ -573,13 +582,18 @@ for step in range(start_step, num_iterations + 1):
     profiling = step == args.profile_step
     if profiling:
         from torch.profiler import ProfilerActivity, profile
-        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True)
         prof.__enter__()
+        torch.cuda.reset_peak_memory_stats()
+        mem = {"step start": torch.cuda.memory_allocated()}
     synchronize()
     t0 = time.time()
     expert_counts = None
     for micro_step in range(grad_accum_steps):
         logits, loss, combined_aux_loss = model(x, y)
+        if profiling and micro_step == 0:
+            mem["after 1st forward"] = torch.cuda.memory_allocated()
+            mem["peak in 1st forward"] = torch.cuda.max_memory_allocated()
         if combined_aux_loss is not None and "tokens_per_expert" in combined_aux_loss:
             c = combined_aux_loss["tokens_per_expert"].long()
             expert_counts = c if expert_counts is None else expert_counts + c
@@ -619,20 +633,26 @@ for step in range(start_step, num_iterations + 1):
     if profiling:
         prof.__exit__(None, None, None)
         if master_process:
+            # GPU kernels only (CPU-side ops' device time would double count their kernels)
             kinds = {"comm (nccl)": ("nccl",), "attention": ("flash", "fmha"),
-                     "matmul": ("gemm", "cutlass", "s16816", "s1688", "xmma", "matmul")}
-            by_kind = {}
+                     "matmul": ("gemm", "cutlass", "s16816", "s1688", "xmma"),
+                     "moe (triton)": ("_sdd", "_dsd", "_dds", "padded_", "gather", "scatter",
+                                      "sort", "histogram", "topology", "cumsum", "binned")}
+            by_kind, kernels = {}, []
             for e in prof.key_averages():
-                t = getattr(e, "device_time_total", 0)
-                if t <= 0:
+                if e.device_type != torch.autograd.DeviceType.CUDA:
                     continue
-                k = next((k for k, pats in kinds.items() if any(x in e.key.lower() for x in pats)), "other")
-                by_kind[k] = by_kind.get(k, 0) + t / 1e3
+                t = e.device_time_total / 1e3
+                kernels.append((t, e.key))
+                k = next((k for k, pats in kinds.items() if any(x in e.key.lower() for x in pats)), "other kernels")
+                by_kind[k] = by_kind.get(k, 0) + t
+            mem["peak in step"] = torch.cuda.max_memory_allocated()
+            print0("PROFILE memory (GB): " + ", ".join(f"{k} {v/1e9:.2f}" for k, v in mem.items()))
             print0(f"PROFILE step {step}: wall {dt*1e3:.0f} ms = fwd+bwd {1e3*(t_fwdbwd-t0):.0f} ms "
-                   f"+ optimizer/sync {1e3*(t1-t_fwdbwd):.0f} ms | GPU time (kernels may overlap): "
+                   f"+ optimizer/sync {1e3*(t1-t_fwdbwd):.0f} ms | GPU kernel time (comm overlaps compute): "
                    + ", ".join(f"{k} {v:.0f} ms" for k, v in sorted(by_kind.items(), key=lambda kv: -kv[1])))
-            for e in sorted(prof.key_averages(), key=lambda e: -getattr(e, "device_time_total", 0))[:15]:
-                print0(f"  {getattr(e, 'device_time_total', 0)/1e3:8.1f} ms  {e.key[:100]}")
+            for t, key in sorted(kernels, reverse=True)[:15]:
+                print0(f"  {t:8.1f} ms  {key[:110]}")
             trace = os.path.join(base_dir, f"profile_{model_tag or 'run'}_step{step}.json")
             prof.export_chrome_trace(trace)
             print0(f"PROFILE trace: {trace}")
