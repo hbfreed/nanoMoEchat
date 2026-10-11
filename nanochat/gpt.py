@@ -15,7 +15,6 @@ Notable features:
 
 import math
 from dataclasses import dataclass, field
-from functools import partial
 
 import stk
 import stk.ops
@@ -65,7 +64,7 @@ from megablocks.layers.relu_squared import relu_squared
 from megablocks.backend.fused_moe import FusedMoEPlan
 from megablocks.backend.grouped_moe import grouped_moe
 
-from nanochat.adamw import DistAdamW
+from nanochat.adamw import AdamW, DistAdamW
 from nanochat.common import COMPUTE_DTYPE, get_dist_info, print0
 from nanochat.flash_attention import flash_attn
 from nanochat.muon import DistMuon, Muon
@@ -111,7 +110,7 @@ class GPTConfig:
     # "compiled": plain lm_head matmul + CE in its own compiled graph; exact and
     # faster, but materializes the (tokens x vocab) logits.
     # "chunked": same speed as "compiled", logits only one 4096-token chunk at a time.
-    loss_impl: str = "cce_kahan_full_c"
+    loss_impl: str = "chunked"
 
 
 class Linear(nn.Linear):
@@ -910,8 +909,11 @@ class GPT(nn.Module):
         return num_flops_per_token
 
     def setup_optimizers(
-        self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0
+        self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
+        stochastic_rounding=False, optim_state_dtype=None,
     ):
+        """stochastic_rounding: stochastically round bf16 weight updates.
+        optim_state_dtype: dtype for momentum / Adam moments (default: the param's)."""
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
@@ -937,12 +939,17 @@ class GPT(nn.Module):
         # ranks; DistAdamW slices dim 0, zero-padding the last slice if needed. Both
         # all-gather the updated weights, so replicas stay identical by construction.
         use_sharded = ddp
-        AdamWFactory = (
-            DistAdamW if use_sharded else partial(torch.optim.AdamW, fused=True)
+        precision_kwargs = dict(
+            stochastic_rounding=stochastic_rounding, state_dtype=optim_state_dtype
         )
-        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        if use_sharded:
+            adamw_optimizer = DistAdamW(adam_groups, **adamw_kwargs, **precision_kwargs)
+        elif stochastic_rounding or optim_state_dtype is not None:
+            adamw_optimizer = AdamW(adam_groups, **adamw_kwargs, **precision_kwargs)
+        else:
+            adamw_optimizer = torch.optim.AdamW(adam_groups, **adamw_kwargs, fused=True)
         # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, **precision_kwargs)
         MuonFactory = DistMuon if use_sharded else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list

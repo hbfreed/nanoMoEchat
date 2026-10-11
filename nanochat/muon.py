@@ -6,6 +6,8 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 
+from nanochat.precision import apply_update_
+
 @torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
@@ -56,9 +58,14 @@ class Muon(torch.optim.Optimizer):
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
+        stochastic_rounding: stochastically round bf16 weight updates.
+        state_dtype: dtype for the momentum buffer (default: the grad's dtype).
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
+                 stochastic_rounding=False, state_dtype=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        self.stochastic_rounding = stochastic_rounding
+        self.state_dtype = state_dtype
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -75,12 +82,13 @@ class Muon(torch.optim.Optimizer):
                 assert g is not None
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
+                    state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
                 buf: Tensor = state["momentum_buffer"]
-                buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                buf.lerp_(g.to(buf.dtype), 1 - group["momentum"])
+                g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+                apply_update_(p, g, -group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5,
+                              self.stochastic_rounding)
 
 
 class DistMuon(torch.optim.Optimizer):
@@ -105,8 +113,11 @@ class DistMuon(torch.optim.Optimizer):
         ns_steps: number of Newton–Schulz iterations for the orthogonalization
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
-                 nesterov: bool = True, ns_steps: int = 5):
+                 nesterov: bool = True, ns_steps: int = 5,
+                 stochastic_rounding: bool = False, state_dtype=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        self.stochastic_rounding = stochastic_rounding
+        self.state_dtype = state_dtype
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
@@ -169,13 +180,13 @@ class DistMuon(torch.optim.Optimizer):
                     g = p.grad  # now averaged across ranks
                     state = self.state[p]
                     if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
+                        state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
                     buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1.0 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
+                    g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                     scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
-                    p.add_(g, alpha=-group["lr"] * scale)
+                    apply_update_(p, g, -group["lr"] * scale, self.stochastic_rounding)
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
                 ag_output = params[base_i:base_i + world_size]

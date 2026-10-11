@@ -80,8 +80,10 @@ parser.add_argument("--bias-momentum", type=float, default=0.5, help="SMEBU mome
 parser.add_argument("--bias-kappa", type=float, default=2.0, help="SMEBU tanh saturation speed (kappa)")
 parser.add_argument("--fp32-master-weights", action="store_true", help="keep params/optimizer state in fp32, cast to bf16 in forward")
 parser.add_argument("--seed", type=int, default=42, help="seed for model init (compute_init seeds 42)")
+parser.add_argument("--stochastic-rounding", action="store_true", help="stochastically round bf16 weight updates (Muon and AdamW)")
+parser.add_argument("--bf16-optim-state", action="store_true", help="store momentum / Adam moments in bf16 (use with --fp32-master-weights)")
 parser.add_argument("--replica-check-every", type=int, default=250, help="multi-GPU: every N steps, check all ranks hold identical weights and resync from rank 0 if not (-1 = off)")
-parser.add_argument("--loss-impl", type=str, default="cce_kahan_full_c", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"], help="lm_head + cross-entropy implementation")
+parser.add_argument("--loss-impl", type=str, default="chunked", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"], help="lm_head + cross-entropy implementation")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -256,6 +258,8 @@ optimizers = model.setup_optimizers(
     embedding_lr=args.embedding_lr,
     matrix_lr=args.matrix_lr,
     weight_decay=args.weight_decay,
+    stochastic_rounding=args.stochastic_rounding,
+    optim_state_dtype=torch.bfloat16 if args.bf16_optim_state else None,
 )
 adamw_optimizer, muon_optimizer = optimizers
 
