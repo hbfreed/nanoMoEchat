@@ -32,6 +32,7 @@ import random
 import time
 
 import numpy as np
+import torch
 import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer, pre_tokenizers
@@ -200,6 +201,20 @@ for name in ("tokenizer_config.json", "chat_template.jinja"):
         content = json.dumps(cfg, indent=2, ensure_ascii=False)
     with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
         f.write(content)
+
+# token_bytes.pt for bpb: UTF-8 bytes per token, 0 for special tokens (as tok_train.py)
+bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+cs, n = bs[:], 0
+for b in range(256):  # GPT-2 byte-level alphabet: byte -> printable char
+    if b not in bs:
+        bs.append(b)
+        cs.append(256 + n)
+        n += 1
+char_to_byte = {chr(c): b for b, c in zip(bs, cs)}
+token_bytes = [len(id_to_str[old]) for old in kept_base]  # one alphabet char per byte
+assert all(ch in char_to_byte for old in kept_base for ch in id_to_str[old])
+torch.save(torch.tensor(token_bytes + [0] * len(specials), dtype=torch.int32),
+           os.path.join(out_dir, "token_bytes.pt"))
 
 # ---- verify on held-out text ----
 trimmed = Tokenizer.from_file(os.path.join(out_dir, "tokenizer.json"))

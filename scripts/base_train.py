@@ -41,7 +41,7 @@ from nanochat.flash_attention import ATTN_IMPL
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.muon import DistMuon
-from nanochat.tokenizer import get_token_bytes, get_tokenizer
+from nanochat.tokenizer import get_token_bytes, get_tokenizer, get_tokenizer_name
 from scripts.base_eval import evaluate_model
 
 print_banner()
@@ -113,10 +113,13 @@ parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="e
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default="", help="override model tag for checkpoint directory name")
+parser.add_argument("--tokenizer", type=str, default="", help="tokenizer dir under the base dir (default: $NANOCHAT_TOKENIZER or 'tokenizer'), e.g. tokenizer_qwen49152")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint every N steps (-1 = only at end)")
 parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 args = parser.parse_args()
+if args.tokenizer:  # get_tokenizer() everywhere, incl. the dataloaders, reads this
+    os.environ["NANOCHAT_TOKENIZER"] = args.tokenizer
 user_config = vars(args).copy()  # for logging
 # Convert expert_sizes from list of lists to list of tuples (JSON gives lists)
 args.expert_sizes = [tuple(x) for x in args.expert_sizes]
@@ -465,7 +468,7 @@ for step in range(start_step, num_iterations + 1):
         ]
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
+            tokens = tokenizer(prompt, prepend=tokenizer.get_bos_token_id())
             sample, _ = engine.generate_batch(
                 tokens, num_samples=1, max_tokens=16, temperature=0
             )
@@ -498,6 +501,7 @@ for step in range(start_step, num_iterations + 1):
                 "user_config": user_config,
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
+                "tokenizer": get_tokenizer_name(),
             },
             protect=protect,
             keep_last_n=keep_last_n,

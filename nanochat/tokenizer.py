@@ -147,6 +147,58 @@ class HuggingFaceTokenizer:
         print(f"Saved tokenizer to {tokenizer_path}")
 
 # -----------------------------------------------------------------------------
+# Trimmed Qwen tokenizer (scripts/trim_qwen_tokenizer.py), for same-vocab
+# distillation from Qwen teachers. Documents are separated by <|endoftext|>.
+
+class QwenTokenizer:
+
+    def __init__(self, tokenizer, tokenizer_dir):
+        self.tokenizer = tokenizer
+        self.tokenizer_dir = tokenizer_dir
+        self.bos_token_id = tokenizer.token_to_id("<|endoftext|>")
+        assert self.bos_token_id is not None
+
+    @classmethod
+    def from_directory(cls, tokenizer_dir):
+        return cls(HFTokenizer.from_file(os.path.join(tokenizer_dir, "tokenizer.json")), tokenizer_dir)
+
+    def get_vocab_size(self):
+        return self.tokenizer.get_vocab_size()
+
+    def get_special_tokens(self):
+        return {t.content for t in self.tokenizer.get_added_tokens_decoder().values()}
+
+    def id_to_token(self, id):
+        return self.tokenizer.id_to_token(id)
+
+    def encode_special(self, text):
+        # None for nanochat's own chat tokens (<|user_start|> etc.), which Qwen does not have
+        return self.tokenizer.token_to_id(text)
+
+    def get_bos_token_id(self):
+        return self.bos_token_id
+
+    def encode(self, text, prepend=None, append=None, num_threads=None):
+        # num_threads is accepted for RustBPETokenizer compatibility; HF tokenizers parallelizes batches itself
+        special = lambda x: x if isinstance(x, int) else self.encode_special(x)
+        head = [special(prepend)] if prepend is not None else []
+        tail = [special(append)] if append is not None else []
+        if isinstance(text, str):
+            return head + self.tokenizer.encode(text, add_special_tokens=False).ids + tail
+        if isinstance(text, list):
+            return [head + e.ids + tail for e in self.tokenizer.encode_batch(text, add_special_tokens=False)]
+        raise ValueError(f"Invalid input type: {type(text)}")
+
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
+
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+
+    def render_conversation(self, conversation, max_tokens=2048):
+        raise NotImplementedError("chat rendering for the Qwen tokenizer is not implemented yet")
+
+# -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
 import rustbpe
@@ -376,20 +428,24 @@ class RustBPETokenizer:
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
-def get_tokenizer():
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    return RustBPETokenizer.from_directory(tokenizer_dir)
+def get_tokenizer_name():
+    """Tokenizer directory under the base dir: $NANOCHAT_TOKENIZER, default 'tokenizer'
+    (our rustbpe tokenizer); e.g. 'tokenizer_qwen49152' for a trimmed Qwen one."""
+    return os.environ.get("NANOCHAT_TOKENIZER", "tokenizer")
 
-def get_token_bytes(device="cpu"):
+def get_tokenizer(name=None):
+    from nanochat.common import get_base_dir
+    tokenizer_dir = os.path.join(get_base_dir(), name or get_tokenizer_name())
+    if os.path.exists(os.path.join(tokenizer_dir, "tokenizer.pkl")):
+        return RustBPETokenizer.from_directory(tokenizer_dir)
+    return QwenTokenizer.from_directory(tokenizer_dir)
+
+def get_token_bytes(device="cpu", name=None):
     import torch
     from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    tokenizer_dir = os.path.join(get_base_dir(), name or get_tokenizer_name())
     token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
+    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py / trim_qwen_tokenizer.py"
     with open(token_bytes_path, "rb") as f:
         token_bytes = torch.load(f, map_location=device)
     return token_bytes

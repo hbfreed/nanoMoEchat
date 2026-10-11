@@ -221,7 +221,8 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
-    tokenizer = get_tokenizer()
+    # checkpoints record their tokenizer; older ones predate the field
+    tokenizer = get_tokenizer(meta_data.get("tokenizer"))
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"]
     return model, tokenizer, meta_data
