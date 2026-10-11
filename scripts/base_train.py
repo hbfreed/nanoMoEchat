@@ -118,7 +118,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint 
 parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 parser.add_argument("--profile-step", type=int, default=-1, help="profile this step: per-phase wall time and GPU time by kernel type (rank 0), plus a chrome trace in the checkpoint dir's parent")
-parser.add_argument("--muon-per-expert", action="store_true", help="Muon orthogonalizes each MoE expert's matrices separately (with --fsdp, experts are sharded whole, so no optimizer communication)")
+parser.add_argument("--muon-per-expert", action=argparse.BooleanOptionalAction, default=True, help="Muon orthogonalizes each MoE expert's matrices separately rather than the concatenated (n_embd, E*width) matrices (with --fsdp, experts are sharded whole, so no optimizer communication). A/B, depth-4 192x256 top-4, 2000 steps: val bpb 1.1300 vs 1.1398 joint")
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to fit bigger micro-batches")
 parser.add_argument("--checkpoint-layers", type=int, default=-1, help="with --activation-checkpointing: checkpoint only the first N blocks (-1: all), trading memory for less recompute")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
