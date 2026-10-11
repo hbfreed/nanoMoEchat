@@ -19,8 +19,11 @@ import torch.nn.functional as F
 def _chunk_loss_and_dlogits(logits, targets, softcap: float):
     """Sum of CE over the chunk and d(sum CE)/d(raw logits), for softcapped logits."""
     z = logits.float()
-    t = torch.tanh(z / softcap)
-    capped = softcap * t
+    if softcap > 0:
+        t = torch.tanh(z / softcap)
+        capped = softcap * t
+    else:  # no softcap
+        capped = z
     lse = torch.logsumexp(capped, dim=-1)
     valid = targets != -1
     tgt = targets.clamp(min=0)
@@ -28,14 +31,18 @@ def _chunk_loss_and_dlogits(logits, targets, softcap: float):
     loss_sum = ((lse - picked) * valid).sum()
     probs = torch.exp(capped - lse[:, None])
     dcapped = probs - F.one_hot(tgt, logits.size(-1)).to(probs.dtype)
-    dlogits = dcapped * (1 - t * t) * valid[:, None]  # d(softcap*tanh(z/softcap))/dz
+    if softcap > 0:
+        dcapped = dcapped * (1 - t * t)  # d(softcap*tanh(z/softcap))/dz
+    dlogits = dcapped * valid[:, None]
     return loss_sum, dlogits.to(logits.dtype)
 
 
 @torch.compile(dynamic=False)
 def _chunk_losses(logits, targets, softcap: float):
     """Per-token CE (0 where target == -1), for no-grad evaluation."""
-    capped = softcap * torch.tanh(logits.float() / softcap)
+    capped = logits.float()
+    if softcap > 0:
+        capped = softcap * torch.tanh(capped / softcap)
     return F.cross_entropy(capped, targets, ignore_index=-1, reduction="none")
 
 

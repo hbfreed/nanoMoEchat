@@ -32,6 +32,9 @@ parser.add_argument("--num-active-experts", type=int, default=4)
 parser.add_argument("--mlp-act", type=str, default="relu2", choices=["relu2", "swiglu"])
 parser.add_argument("--vocab-size", type=int, default=50304)
 parser.add_argument("--max-seq-len", type=int, default=1024)
+parser.add_argument("--window-pattern", type=str, default="L")
+parser.add_argument("--sliding-window", type=int, default=-1)
+parser.add_argument("--arch", type=str, default="nanochat", choices=["nanochat", "afmoe"])
 parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--fp32-master-weights", action="store_true")
 parser.add_argument("--use-bias-balancing", action="store_true")
@@ -88,7 +91,9 @@ config = GPTConfig(
     n_head=args.num_heads,
     n_kv_head=args.num_kv_heads,
     n_embd=args.model_dim,
-    window_pattern="L",
+    window_pattern=args.window_pattern,
+    sliding_window=args.sliding_window,
+    arch=args.arch,
     expert_sizes=[tuple(x) for x in args.expert_sizes],
     num_active_experts=args.num_active_experts,
     mlp_act=args.mlp_act,
@@ -163,6 +168,8 @@ gpu_total = sum(by_cat.values())
 
 tokens = B * T
 tflops = flops_per_token * tokens / step_s / 1e12
+from nanochat.flash_attention import ATTN_IMPL
+print(f"attention: {ATTN_IMPL} | window pattern {args.window_pattern} (S window {args.sliding_window})")
 print(f"shape: d={args.model_dim} L={args.depth} experts={args.expert_sizes} K={args.num_active_experts} "
       f"{args.mlp_act} seq={T} batch={B} {'fp32-master' if args.fp32_master_weights else 'bf16'}")
 print(f"params {n_params/1e6:.1f}M | step {step_s*1e3:.1f} ms | {tokens/step_s:,.0f} tok/s | "

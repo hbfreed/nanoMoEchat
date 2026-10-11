@@ -37,7 +37,7 @@ from nanochat.common import (
 )
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.engine import Engine
-from nanochat.flash_attention import USE_FA3, HAS_FA3
+from nanochat.flash_attention import ATTN_IMPL
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.muon import DistMuon
@@ -81,6 +81,13 @@ parser.add_argument("--bias-kappa", type=float, default=2.0, help="SMEBU tanh sa
 parser.add_argument("--fp32-master-weights", action="store_true", help="keep params/optimizer state in fp32, cast to bf16 in forward")
 parser.add_argument("--seed", type=int, default=42, help="seed for model init (compute_init seeds 42)")
 parser.add_argument("--stochastic-rounding", action="store_true", help="stochastically round bf16 weight updates (Muon and AdamW)")
+parser.add_argument("--arch", type=str, default="nanochat", choices=["nanochat", "afmoe"], help="block architecture; afmoe converts to transformers/vLLM AfmoeForCausalLM")
+parser.add_argument("--sliding-window", type=int, default=-1, help="window (tokens incl. current) for S layers in --window-pattern (-1: seq_len // 2)")
+parser.add_argument("--rope-theta", type=float, default=10000.0, help="RoPE base")
+parser.add_argument("--num-shared-experts", type=int, default=0, help="afmoe: shared experts (each as wide as a routed expert)")
+parser.add_argument("--num-dense-layers", type=int, default=0, help="afmoe: first k layers use a dense SwiGLU MLP")
+parser.add_argument("--dense-intermediate-size", type=int, default=0, help="afmoe: dense MLP width (0: 4 * model dim)")
+parser.add_argument("--norm-lr", type=float, default=0.004, help="AdamW LR for norm weights (afmoe)")
 parser.add_argument("--bf16-optim-state", action="store_true", help="store momentum / Adam moments in bf16 (use with --fp32-master-weights)")
 parser.add_argument("--replica-check-every", type=int, default=250, help="multi-GPU: every N steps, check all ranks hold identical weights and resync from rank 0 if not (-1 = off)")
 parser.add_argument("--loss-impl", type=str, default="chunked", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"], help="lm_head + cross-entropy implementation")
@@ -129,10 +136,7 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-if USE_FA3:
-    print0("Using Flash Attention 3 (Hopper GPU detected)")
-else:
-    print0("Using PyTorch SDPA fallback (FA3 not available)")
+print0(f"Attention: {ATTN_IMPL} ({'sliding windows are dense-masked and slow' if ATTN_IMPL == 'sdpa' else 'real sliding-window kernels'})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
@@ -202,6 +206,12 @@ model_config_kwargs = dict(
     bias_kappa=args.bias_kappa,
     fp32_master_weights=args.fp32_master_weights,
     loss_impl=args.loss_impl,
+    arch=args.arch,
+    sliding_window=args.sliding_window,
+    rope_theta=args.rope_theta,
+    num_shared_experts=args.num_shared_experts,
+    num_dense_layers=args.num_dense_layers,
+    dense_intermediate_size=args.dense_intermediate_size,
 )
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
@@ -260,6 +270,7 @@ optimizers = model.setup_optimizers(
     weight_decay=args.weight_decay,
     stochastic_rounding=args.stochastic_rounding,
     optim_state_dtype=torch.bfloat16 if args.bf16_optim_state else None,
+    norm_lr=args.norm_lr,
 )
 adamw_optimizer, muon_optimizer = optimizers
 

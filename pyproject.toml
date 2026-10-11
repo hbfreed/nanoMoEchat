@@ -78,6 +78,9 @@ cpu = [
 ]  
 gpu = [  
     "torch>=2.9.1",
+    # FlashAttention-2: real sliding-window kernels on Ampere (SDPA dense-masks them).
+    # Built from source; needs a CUDA 13 nvcc on PATH or CUDA_HOME (~30 min, 24 jobs).
+    "flash-attn==2.8.3.post1",
 ]  
   
 [tool.uv]  
@@ -93,6 +96,8 @@ conflicts = [
 # needs a CUDA 13 nvcc on PATH or CUDA_HOME.
 [tool.uv.extra-build-dependencies]
 megablocks = [{ requirement = "torch", match-runtime = true }]
+flash-attn = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "psutil", "einops"]
 
 [tool.uv.extra-build-variables]
 megablocks = { MEGABLOCKS_BUILD_EXTENSIONS = "1" }
+flash-attn = { FLASH_ATTN_CUDA_ARCHS = "80", MAX_JOBS = "24", NVCC_THREADS = "2" }

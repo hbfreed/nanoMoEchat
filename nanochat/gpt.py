@@ -39,7 +39,8 @@ def _softcapped_cross_entropy(x, weight, targets, softcap, reduction):
     Inlined into the model's graph, Inductor keeps several fp32 copies of the
     (tokens x vocab) logits and OOMs; standalone it fuses down to about one."""
     logits = F.linear(x, weight).float()
-    logits = softcap * torch.tanh(logits / softcap)
+    if softcap > 0:
+        logits = softcap * torch.tanh(logits / softcap)
     loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)), targets.view(-1),
         ignore_index=-1, reduction=reduction,
@@ -111,6 +112,20 @@ class GPTConfig:
     # faster, but materializes the (tokens x vocab) logits.
     # "chunked": same speed as "compiled", logits only one 4096-token chunk at a time.
     loss_impl: str = "chunked"
+    # "nanochat": this repo's original block. "afmoe": exactly Arcee's AFMoE
+    # (transformers AfmoeForCausalLM / vLLM afmoe.py), so checkpoints convert
+    # losslessly for serving: learnable RMSNorms before and after attention and
+    # MLP, QK-norm before RoPE, RoPE on sliding-window layers only (full layers
+    # are NoPE, so window_pattern needs some S), sigmoid-gated attention output, no embedding
+    # norm, no logit softcap, SwiGLU experts of one width, optional shared
+    # experts and dense first layers.
+    arch: str = "nanochat"
+    sliding_window: int = -1  # "S" layers' window in tokens incl. current (-1: seq_len // 2)
+    rope_theta: float = 10000.0
+    rms_norm_eps: float = 1e-5  # afmoe norms
+    num_shared_experts: int = 0  # afmoe
+    num_dense_layers: int = 0  # afmoe: first k layers use a dense SwiGLU MLP
+    dense_intermediate_size: int = 0  # afmoe dense MLP width (0: 4 * n_embd)
 
 
 class Linear(nn.Linear):
@@ -119,6 +134,27 @@ class Linear(nn.Linear):
 
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+class RMSNorm(nn.Module):
+    """Learnable RMSNorm, same math as transformers' AfmoeRMSNorm (fp32 inside)."""
+
+    def __init__(self, dim, eps):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        h = x.float()
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (self.weight.float() * h).to(x.dtype)
+
+
+def apply_rotary_emb_hf(x, cos, sin):
+    """RoPE with transformers' rotate_half convention: x*cos + rotate_half(x)*sin."""
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], 3).to(x.dtype)
 
 
 def norm(x):
@@ -151,6 +187,11 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.afmoe = config.arch == "afmoe"
+        if self.afmoe:
+            self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+            self.c_gate = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
 
     def forward(self, x, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -163,8 +204,13 @@ class CausalSelfAttention(nn.Module):
 
         # Apply Rotary Embeddings to queries and keys
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)  # QK norm
+        if self.afmoe:  # learnable QK-norm before RoPE, transformers' rotation
+            q, k = self.q_norm(q), self.k_norm(k)
+            if window_size[0] >= 0:  # AFMoE: RoPE on sliding layers only, full layers are NoPE
+                q, k = apply_rotary_emb_hf(q, cos, sin), apply_rotary_emb_hf(k, cos, sin)
+        else:
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)  # QK norm
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for sliding window, (-1, 0) for full context
@@ -192,6 +238,8 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
+        if self.afmoe:  # gated attention: sigmoid gate on the attention output
+            y = y * torch.sigmoid(self.c_gate(x))
         y = self.c_proj(y)
         return y
 
@@ -207,6 +255,19 @@ class MLP(nn.Module):
         x = F.relu(x).square()
         x = self.c_proj(x)
         return x, None, None
+
+
+class SwiGLUMLP(nn.Module):
+    """Dense SwiGLU MLP: AFMoE's dense first layers and shared experts."""
+
+    def __init__(self, n_embd, hidden):
+        super().__init__()
+        self.c_gate = Linear(n_embd, hidden, bias=False)
+        self.c_fc = Linear(n_embd, hidden, bias=False)
+        self.c_proj = Linear(hidden, n_embd, bias=False)
+
+    def forward(self, x):
+        return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)), None, None
 
 
 class MoEMLP(nn.Module):
@@ -252,6 +313,14 @@ class MoEMLP(nn.Module):
 
         self.mlp_act = config.mlp_act
         assert self.mlp_act in ("relu2", "swiglu"), config.mlp_act
+        self.shared = None
+        if config.arch == "afmoe":
+            assert self.mlp_act == "swiglu", "afmoe experts are SwiGLU"
+            assert len(config.expert_sizes) == 1, "afmoe experts share one width"
+            if config.num_shared_experts > 0:
+                self.shared = SwiGLUMLP(
+                    config.n_embd, config.expert_sizes[0][1] * config.num_shared_experts
+                )
         self.w1 = nn.Parameter(torch.empty(config.n_embd, self.total_expert_width))
         self.w2 = nn.Parameter(torch.empty(self.total_expert_width, config.n_embd))
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
@@ -542,6 +611,8 @@ class MoEMLP(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
         )
+        if self.shared is not None:
+            output = output + self.shared(x)[0]
 
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
 
@@ -743,12 +814,25 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        if config.use_moe:
+        self.afmoe = config.arch == "afmoe"
+        if self.afmoe and layer_idx < config.num_dense_layers:
+            self.mlp = SwiGLUMLP(config.n_embd, config.dense_intermediate_size or 4 * config.n_embd)
+        elif config.use_moe:
             self.mlp = MoEMLP(config)
         else:
             self.mlp = MLP(config)
+        if self.afmoe:  # norms before and after each sublayer, as AFMoE
+            eps = config.rms_norm_eps
+            self.input_norm = RMSNorm(config.n_embd, eps)
+            self.post_attn_norm = RMSNorm(config.n_embd, eps)
+            self.pre_mlp_norm = RMSNorm(config.n_embd, eps)
+            self.post_mlp_norm = RMSNorm(config.n_embd, eps)
 
     def forward(self, x, cos_sin, window_size, kv_cache):
+        if self.afmoe:
+            x = x + self.post_attn_norm(self.attn(self.input_norm(x), cos_sin, window_size, kv_cache))
+            mlp_x, aux_loss, f_i = self.mlp(self.pre_mlp_norm(x))
+            return x + self.post_mlp_norm(mlp_x), aux_loss, f_i
         x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
         mlp_x, aux_loss, f_i = self.mlp(norm(x))
         x = x + mlp_x
@@ -770,6 +854,8 @@ class GPT(nn.Module):
                 ),
             }
         )
+        if config.arch == "afmoe":
+            self.transformer["norm"] = RMSNorm(config.n_embd, config.rms_norm_eps)
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
@@ -778,7 +864,9 @@ class GPT(nn.Module):
             config.sequence_len * 10
         )  # 10X over-compute should be enough
         head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim, base=config.rope_theta
+        )
         self.register_buffer(
             "cos", cos, persistent=False
         )  # persistent=False means it's not saved to the checkpoint
@@ -787,11 +875,13 @@ class GPT(nn.Module):
     @staticmethod
     def _compute_window_sizes(config):
         """Compute per-layer window sizes from the window_pattern string.
-        L = full context (-1, 0), S = half context (seq_len // 2, 0).
+        L = full context (-1, 0), S = sliding window: (sliding_window - 1, 0) since
+        flash-attn counts tokens to the left and transformers/vLLM count the window
+        including the current token; seq_len // 2 if sliding_window is unset.
         Pattern is tiled across layers, but the last layer always gets L (full context).
         """
         pattern = config.window_pattern.upper()
-        half_ctx = config.sequence_len // 2
+        half_ctx = config.sliding_window - 1 if config.sliding_window > 0 else config.sequence_len // 2
         window_map = {
             "L": (-1, 0),  # full context
             "S": (half_ctx, 0),  # half context sliding window
@@ -813,11 +903,18 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.mlp, "c_proj"):
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if getattr(block.mlp, "shared", None) is not None:
+                torch.nn.init.zeros_(block.mlp.shared.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim, base=self.config.rope_theta
+        )
         self.cos, self.sin = cos, sin
+        for m in self.modules():  # learnable norms start at identity
+            if isinstance(m, RMSNorm):
+                torch.nn.init.ones_(m.weight)
         # Reinitialize MoE buffers AND raw expert weight Parameters lost
         # during meta device -> to_empty (w1/w2/w3 are not nn.Linear, so
         # self.apply(self._init_weights) never touches them; left at zero
@@ -910,19 +1007,25 @@ class GPT(nn.Module):
 
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
-        stochastic_rounding=False, optim_state_dtype=None,
+        stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004,
     ):
-        """stochastic_rounding: stochastically round bf16 weight updates.
+        """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
+        stochastic_rounding: stochastically round bf16 weight updates.
         optim_state_dtype: dtype for momentum / Adam moments (default: the param's)."""
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate out all parameters into 4 groups: matrices (Muon), embedding,
+        # lm_head, and 1-D params like afmoe's norm weights (AdamW; Muon is 2-D only)
+        block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in block_params if p.ndim == 2]
+        scalar_params = [p for p in block_params if p.ndim < 2]
+        if "norm" in self.transformer:
+            scalar_params += list(self.transformer.norm.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(
-            embedding_params
-        ) + len(lm_head_params)
+            scalar_params
+        ) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -934,6 +1037,8 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        if scalar_params:
+            adam_groups.append(dict(params=scalar_params, lr=norm_lr))
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         # Sharded optimizers (any world size): DistMuon assigns whole matrices to owner
         # ranks; DistAdamW slices dim 0, zero-padding the last slice if needed. Both
@@ -981,7 +1086,9 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
-        x = norm(x)
+        afmoe = self.config.arch == "afmoe"
+        if not afmoe:
+            x = norm(x)
 
         combined_aux_loss = None
         aux_loss_count = 0
@@ -1037,10 +1144,10 @@ class GPT(nn.Module):
                 combined_aux_loss = {}
             combined_aux_loss["expert_bias_per_layer"] = expert_bias_per_layer
 
-        x = norm(x)
+        x = self.transformer.norm(x) if afmoe else norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15
+        softcap = 0 if afmoe else 15  # 0 = no softcap
         if targets is not None:
             # training mode: compute and return the loss
             # CCE fuses lm_head + softcap + cross_entropy without materializing logits
@@ -1059,7 +1166,7 @@ class GPT(nn.Module):
                     x,
                     self.lm_head.weight.to(x.dtype),
                     targets,
-                    softcap=float(softcap),
+                    softcap=float(softcap) if softcap else None,
                     ignore_index=-1,
                     reduction=loss_reduction,
                     impl=self.config.loss_impl,
@@ -1099,7 +1206,8 @@ class GPT(nn.Module):
         else:
             # inference mode: compute and return the logits
             logits = self.lm_head(x)
-            logits = softcap * torch.tanh(logits / softcap)  # logits softcap
+            if softcap:
+                logits = softcap * torch.tanh(logits / softcap)  # logits softcap
             return logits
 
     @torch.inference_mode()
