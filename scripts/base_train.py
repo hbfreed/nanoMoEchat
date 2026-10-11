@@ -78,6 +78,10 @@ parser.add_argument("--use-bias-balancing", action="store_true", help="enable bi
 parser.add_argument("--bias-update-speed", type=float, default=0.0005, help="SMEBU learning rate (lambda)")
 parser.add_argument("--bias-momentum", type=float, default=0.5, help="SMEBU momentum factor (beta)")
 parser.add_argument("--bias-kappa", type=float, default=2.0, help="SMEBU tanh saturation speed (kappa)")
+parser.add_argument("--fp32-master-weights", action="store_true", help="keep params/optimizer state in fp32, cast to bf16 in forward")
+parser.add_argument("--seed", type=int, default=42, help="seed for model init (compute_init seeds 42)")
+parser.add_argument("--replica-check-every", type=int, default=250, help="multi-GPU: every N steps, check all ranks hold identical weights and resync from rank 0 if not (-1 = off)")
+parser.add_argument("--loss-impl", type=str, default="cce_kahan_full_c", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"], help="lm_head + cross-entropy implementation")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -112,6 +116,7 @@ args.expert_sizes = [tuple(x) for x in args.expert_sizes]
 # Compute init
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+torch.manual_seed(args.seed)
 master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -193,6 +198,8 @@ model_config_kwargs = dict(
     bias_update_speed=args.bias_update_speed,
     bias_momentum=args.bias_momentum,
     bias_kappa=args.bias_kappa,
+    fp32_master_weights=args.fp32_master_weights,
+    loss_impl=args.loss_impl,
 )
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
@@ -255,13 +262,31 @@ adamw_optimizer, muon_optimizer = optimizers
 # setup_optimizers only uses the sharded DistMuon/DistAdamW (which reduce-scatter grads
 # themselves) for power-of-2 world sizes. Otherwise nothing syncs grads and each rank
 # silently trains its own model, so average them before stepping.
-sync_grads = ddp and not isinstance(muon_optimizer, DistMuon)
+sharded_optim = isinstance(muon_optimizer, DistMuon)
+sync_grads = ddp and not sharded_optim
+# sharded optimizer state lives on every rank, so every rank saves/loads its own shard
+optim_shard_rank = ddp_rank if sharded_optim else None
+print0(f"Optimizers: {'sharded (DistMuon/DistAdamW)' if sharded_optim else 'replicated'}")
 # SMEBU expert biases update from each rank's local token counts, so they drift apart
 # across ranks under any multi-GPU setup; average them after every step.
 expert_bias_buffers = [
     b for name, b in orig_model.named_buffers()
     if name.endswith(("expert_bias", "expert_bias_momentum"))
 ]
+
+
+def check_replicas_(step):
+    """Ranks should hold bit-identical weights; if any drifted, warn and resync from rank 0.
+    One small all_gather of per-tensor checksums, so cheap enough to run periodically."""
+    state = list(orig_model.parameters()) + expert_bias_buffers
+    sums = torch.stack([t.detach().double().sum() for t in state])
+    gathered = [torch.empty_like(sums) for _ in range(ddp_world_size)]
+    dist.all_gather(gathered, sums)
+    drifted = sum(not torch.equal(gathered[0], g) for g in gathered[1:])
+    if drifted:
+        print0(f"WARNING step {step}: {drifted} rank(s) drifted from rank 0's weights; resyncing")
+        for t in state:
+            dist.broadcast(t.data, src=0)
 
 
 def all_reduce_avg_(tensors):
@@ -284,7 +309,8 @@ if args.resume_from_step != -1:
     resume_dir = os.path.join(base_dir, "base_checkpoints", resume_tag)
     print0(f"Resuming from step {args.resume_from_step} in {resume_dir}")
     model_data, optimizer_data, _meta = load_checkpoint(
-        resume_dir, args.resume_from_step, device, load_optimizer=True
+        resume_dir, args.resume_from_step, device, load_optimizer=True,
+        shard_rank=optim_shard_rank,
     )
     # Strip torch.compile's "_orig_mod." prefix from state_dict keys
     model_data = {k.lstrip("_orig_mod."): v for k, v in model_data.items()}
@@ -354,6 +380,7 @@ def get_muon_momentum(it):
 # -----------------------------------------------------------------------------
 # Training loop
 min_val_bpb = float("inf")
+val_bpb = None  # stays None if --eval-every=-1
 smooth_train_loss = 0  # EMA of training loss
 ema_beta = 0.9  # EMA decay factor
 total_training_time = 0  # total wall-clock time of training
@@ -436,7 +463,7 @@ for step in range(start_step, num_iterations + 1):
     warmdown_start = num_iterations - round(warmdown_ratio * num_iterations)
     at_warmdown_start = step == warmdown_start and warmdown_ratio > 0
     should_save = last_step or at_warmdown_start or (save_every > 0 and step > 0 and step % save_every == 0)
-    if master_process and should_save:
+    if should_save and (master_process or sharded_optim):
         output_dirname = model_tag if model_tag else f"d{depth}"  # e.g. d12
         checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
         # Protect "important" saves from pruning: the pre-decay snapshot
@@ -447,7 +474,7 @@ for step in range(start_step, num_iterations + 1):
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(),
+            orig_model.state_dict() if master_process else None,
             [opt.state_dict() for opt in optimizers],
             {
                 "step": step,
@@ -459,6 +486,7 @@ for step in range(start_step, num_iterations + 1):
             },
             protect=protect,
             keep_last_n=keep_last_n,
+            shard_rank=optim_shard_rank,
         )
 
     if last_step:
@@ -492,6 +520,8 @@ for step in range(start_step, num_iterations + 1):
     model.zero_grad(set_to_none=True)
     if ddp:
         all_reduce_avg_(expert_bias_buffers)
+        if args.replica_check_every > 0 and step % args.replica_check_every == 0:
+            check_replicas_(step)
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -603,6 +633,6 @@ get_report().log(
 wandb_run.finish()
 # Ensure the final async checkpoint save is flushed to disk before we tear
 # down the distributed / CUDA runtime.
-if master_process:
+if master_process or sharded_optim:
     wait_for_checkpoint()
 compute_cleanup()

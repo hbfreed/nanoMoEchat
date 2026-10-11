@@ -63,29 +63,37 @@ def _prune_old_checkpoints(checkpoint_dir, keep_last_n):
         return
     for f in unprotected[:n_to_delete]:
         step_str = os.path.basename(f)[len("model_"):-len(".pt")]
-        for sibling in (
-            f"model_{step_str}.pt",
-            f"optim_{step_str}.pt",
-            f"meta_{step_str}.json",
-        ):
+        siblings = [f"model_{step_str}.pt", f"optim_{step_str}.pt", f"meta_{step_str}.json"]
+        siblings += [os.path.basename(p) for p in glob.glob(
+            os.path.join(checkpoint_dir, f"optim_{step_str}_rank*.pt"))]
+        for sibling in siblings:
             target = os.path.join(checkpoint_dir, sibling)
             if os.path.exists(target):
                 os.remove(target)
                 log0(f"Pruned old checkpoint file: {target}")
 
 
-def _write_checkpoint_worker(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect, keep_last_n):
+def _optim_filename(step, shard_rank=None):
+    """optim_<step>.pt for a replicated optimizer, optim_<step>_rank<r>.pt for a sharded one."""
+    suffix = "" if shard_rank is None else f"_rank{shard_rank}"
+    return f"optim_{step:06d}{suffix}.pt"
+
+
+def _write_checkpoint_worker(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect,
+                             keep_last_n, shard_rank=None):
     """Background-thread worker: serializes CPU tensors and optionally prunes."""
     global _save_error
     try:
         os.makedirs(checkpoint_dir, exist_ok=True)
+        if optim_cpu is not None:
+            optimizer_path = os.path.join(checkpoint_dir, _optim_filename(step, shard_rank))
+            _atomic_torch_save(optim_cpu, optimizer_path)
+            log0(f"Saved optimizer file to: {optimizer_path}")
+        if model_cpu is None:  # non-zero rank of a sharded optimizer: its shard only
+            return
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         _atomic_torch_save(model_cpu, model_path)
         log0(f"Saved model file to: {model_path}")
-        if optim_cpu is not None:
-            optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
-            _atomic_torch_save(optim_cpu, optimizer_path)
-            log0(f"Saved optimizer file to: {optimizer_path}")
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         tmp_meta = meta_path + ".tmp"
         with open(tmp_meta, "w") as f:
@@ -122,7 +130,7 @@ def wait_for_checkpoint():
 
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
-                    protect=False, keep_last_n=None):
+                    protect=False, keep_last_n=None, shard_rank=None):
     """Async checkpoint save.
 
     The state_dicts are cloned to CPU synchronously (so training can safely
@@ -138,32 +146,46 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         keep_last_n: if set, after this save the oldest non-protected
             checkpoints in checkpoint_dir are deleted so only the most
             recent keep_last_n remain.
+        shard_rank: for sharded optimizers (DistMuon/DistAdamW) every rank calls
+            this with its own rank and optimizer shard; it is written as
+            optim_<step>_rank<r>.pt. Ranks other than 0 pass model_data=None and
+            write only their shard.
     """
-    assert int(os.environ.get('RANK', 0)) == 0  # prevent footguns for now
+    rank = int(os.environ.get('RANK', 0))
+    assert rank == 0 or (shard_rank == rank and model_data is None), \
+        "only rank 0 saves the model; other ranks may only save their optimizer shard"
     global _save_thread
     # Ensure the previous save has finished before starting another. Keeps
     # CPU memory bounded and serializes disk access.
     wait_for_checkpoint()
     # Synchronous: clone state to CPU. This is what blocks the training loop.
     # PCIe DtoH is fast (~10 GB/s) compared to the subsequent disk write.
-    model_cpu = _to_cpu_state(model_data)
+    model_cpu = _to_cpu_state(model_data) if model_data is not None else None
     optim_cpu = _to_cpu_state(optimizer_data) if optimizer_data is not None else None
     _save_thread = threading.Thread(
         target=_write_checkpoint_worker,
-        args=(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect, keep_last_n),
+        args=(checkpoint_dir, step, model_cpu, optim_cpu, meta_data, protect, keep_last_n,
+              shard_rank),
         daemon=False,
     )
     _save_thread.start()
 
 
-def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
+def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, shard_rank=None):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
+        optimizer_path = os.path.join(checkpoint_dir, _optim_filename(step, shard_rank))
+        if not os.path.exists(optimizer_path):
+            other = _optim_filename(step, None if shard_rank is not None else 0)
+            hint = (f" Found {other} instead: the checkpoint was saved with a "
+                    f"{'replicated' if shard_rank is not None else 'sharded'} optimizer, and "
+                    f"resuming across that change (or a different GPU count) isn't supported."
+                    if os.path.exists(os.path.join(checkpoint_dir, other)) else "")
+            raise FileNotFoundError(f"{optimizer_path} not found.{hint}")
         optimizer_data = torch.load(optimizer_path, map_location=device)
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")

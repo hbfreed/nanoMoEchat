@@ -24,12 +24,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 from cut_cross_entropy import linear_cross_entropy
 
+from nanochat.chunked_ce import chunked_softcap_cross_entropy
+
 # CCE is its own fused Triton kernel; Dynamo must not trace into it. Under
 # torch 2.11 tracing reaches CCE's runtime torch-version check and dies on a
 # known Dynamo bug (platform.uname() -> "uname_result_base.__new__() takes 6
 # positional arguments but 7 were given"). A graph break at the loss boundary
 # costs nothing.
 linear_cross_entropy = torch.compiler.disable(linear_cross_entropy)
+
+
+@torch.compile(dynamic=False)
+def _softcapped_cross_entropy(x, weight, targets, softcap, reduction):
+    """lm_head matmul + softcap + CE as plain torch ops, compiled as its own graph.
+    Inlined into the model's graph, Inductor keeps several fp32 copies of the
+    (tokens x vocab) logits and OOMs; standalone it fuses down to about one."""
+    logits = F.linear(x, weight).float()
+    logits = softcap * torch.tanh(logits / softcap)
+    loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), targets.view(-1),
+        ignore_index=-1, reduction=reduction,
+    )
+    return loss.view_as(targets) if reduction == "none" else loss
+
+
+# Graph break at the loss boundary, same as CCE, so it compiles separately.
+# recursive=False: a plain disable would also stop the inner compile and run it
+# eagerly, which OOMs on the fp32 logits.
+def softcapped_cross_entropy(*args):
+    return _softcapped_cross_entropy(*args)
+
+
+softcapped_cross_entropy = torch.compiler.disable(softcapped_cross_entropy, recursive=False)
+chunked_softcap_cross_entropy = torch.compiler.disable(
+    chunked_softcap_cross_entropy, recursive=False
+)
 from einops import rearrange
 from megablocks import ops
 from megablocks.layers.relu_squared import relu_squared
@@ -75,6 +104,22 @@ class GPTConfig:
     bias_update_speed: float = 0.0005  # λ in SMEBU
     bias_momentum: float = 0.5  # β in SMEBU — smooths updates over time
     bias_kappa: float = 2.0  # κ in SMEBU — tanh saturation speed
+    # Keep params (and so optimizer state) in fp32 and cast to COMPUTE_DTYPE in
+    # forward, instead of storing the whole model in COMPUTE_DTYPE.
+    fp32_master_weights: bool = False
+    # "cce_kahan_full_c": fused CCE, exact, no logits in memory, slow backward.
+    # "compiled": plain lm_head matmul + CE in its own compiled graph; exact and
+    # faster, but materializes the (tokens x vocab) logits.
+    # "chunked": same speed as "compiled", logits only one 4096-token chunk at a time.
+    loss_impl: str = "cce_kahan_full_c"
+
+
+class Linear(nn.Linear):
+    """nn.Linear that casts its weight to the input dtype, so fp32 master weights
+    still run bf16 matmuls. A no-op when the weights are already in that dtype."""
+
+    def forward(self, x):
+        return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
 def norm(x):
@@ -103,10 +148,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -155,8 +200,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -204,7 +249,7 @@ class MoEMLP(nn.Module):
             persistent=False,
         )
 
-        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        self.router = Linear(config.n_embd, self.num_experts, bias=False)
 
         self.mlp_act = config.mlp_act
         assert self.mlp_act in ("relu2", "swiglu"), config.mlp_act
@@ -466,9 +511,9 @@ class MoEMLP(nn.Module):
                 selected_experts_flat.int(),
                 self._grouped_plan,
                 self.num_active_experts,
-                self.w1,
-                self.w3,
-                self.w2,
+                self.w1.to(x_flat.dtype),
+                self.w3.to(x_flat.dtype),
+                self.w2.to(x_flat.dtype),
             )
         else:
             # Compute bins for gather/scatter
@@ -480,9 +525,9 @@ class MoEMLP(nn.Module):
             x_permuted = ops.padded_gather(
                 x_flat, indices, bin_ids, bins, padded_bins, self.num_active_experts
             )
-            x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
+            x_permuted = stk.ops.sdd(x_permuted, self.w1.to(x_flat.dtype), topology)
             x_permuted = relu_squared(x_permuted)
-            x_permuted = stk.ops.dsd(x_permuted, self.w2)
+            x_permuted = stk.ops.dsd(x_permuted, self.w2.to(x_flat.dtype))
             x_permuted = ops.padded_scatter(
                 x_permuted,
                 indices,
@@ -726,7 +771,7 @@ class GPT(nn.Module):
                 ),
             }
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -786,7 +831,10 @@ class GPT(nn.Module):
                 block.mlp.init_params()
         # Cast all floating-point params to compute dtype (bf16 on Ampere+)
         # Integer buffers (expert_block_counts etc.) are unaffected
-        if self.transformer.wte.weight.device.type == "cuda":
+        if (
+            self.transformer.wte.weight.device.type == "cuda"
+            and not self.config.fp32_master_weights
+        ):
             self.to(dtype=COMPUTE_DTYPE)
             # Keep expert_bias and momentum in float32 for precise updates
             for block in self.transformer.h:
@@ -885,8 +933,10 @@ class GPT(nn.Module):
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
-        # Use sharded optimizers only if world_size is power of 2 (divisibility requirement)
-        use_sharded = ddp and (world_size & (world_size - 1)) == 0
+        # Sharded optimizers (any world size): DistMuon assigns whole matrices to owner
+        # ranks; DistAdamW slices dim 0, zero-padding the last slice if needed. Both
+        # all-gather the updated weights, so replicas stay identical by construction.
+        use_sharded = ddp
         AdamWFactory = (
             DistAdamW if use_sharded else partial(torch.optim.AdamW, fused=True)
         )
@@ -923,7 +973,7 @@ class GPT(nn.Module):
         )  # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx)
+        x = self.transformer.wte(idx).to(COMPUTE_DTYPE)
         x = norm(x)
 
         combined_aux_loss = None
@@ -987,15 +1037,26 @@ class GPT(nn.Module):
         if targets is not None:
             # training mode: compute and return the loss
             # CCE fuses lm_head + softcap + cross_entropy without materializing logits
-            ce_loss = linear_cross_entropy(
-                x,
-                self.lm_head.weight,
-                targets,
-                softcap=float(softcap),
-                ignore_index=-1,
-                reduction=loss_reduction,
-                impl="cce_kahan_full_c",
-            )
+            if self.config.loss_impl == "chunked":
+                ce_loss = chunked_softcap_cross_entropy(
+                    x, self.lm_head.weight.to(x.dtype), targets,
+                    float(softcap), reduction=loss_reduction,
+                )
+            elif self.config.loss_impl == "compiled":
+                ce_loss = softcapped_cross_entropy(
+                    x, self.lm_head.weight.to(x.dtype), targets,
+                    float(softcap), loss_reduction,
+                )
+            else:
+                ce_loss = linear_cross_entropy(
+                    x,
+                    self.lm_head.weight.to(x.dtype),
+                    targets,
+                    softcap=float(softcap),
+                    ignore_index=-1,
+                    reduction=loss_reduction,
+                    impl=self.config.loss_impl,
+                )
             loss = ce_loss
             # Fold the weighted aux losses into the scalar training loss only.
             # Under loss_reduction="none" the aux scalar would broadcast onto

@@ -10,7 +10,9 @@ from torch import Tensor
 class DistAdamW(torch.optim.Optimizer):
     """
     Distributed AdamW optimizer.
-    In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction
+    In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction.
+    Each param's dim 0 is split across ranks; when it doesn't divide evenly (e.g. a
+    65,536-row embedding on 3 GPUs) the last slice is zero-padded.
     """
     def __init__(self, param_groups, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -24,11 +26,15 @@ class DistAdamW(torch.optim.Optimizer):
         reduce_scatter_futures: list[torch.Future] = []
         all_reduce_futures: list[torch.Future] = []
         grad_slices = []
+        padded_params = []  # (param, padded full-size buffer) to copy back after all_gather
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             for base_i in range(len(params)):
                 grad = params[base_i].grad
-                rank_size = grad.shape[0] // world_size
+                rank_size = -(-grad.shape[0] // world_size)  # ceil
+                pad = rank_size * world_size - grad.shape[0]
+                if pad:
+                    grad = torch.cat([grad, grad.new_zeros(pad, *grad.shape[1:])])
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
                 grad_slices.append(grad_slice)
@@ -42,8 +48,10 @@ class DistAdamW(torch.optim.Optimizer):
             for base in range(len(params)):
                 reduce_scatter_futures[idx].wait()
                 p = params[base]
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+                rank_size = -(-p.shape[0] // world_size)  # ceil
+                pad = rank_size * world_size - p.shape[0]
+                p_full = torch.cat([p, p.new_zeros(pad, *p.shape[1:])]) if pad else p
+                p_slice = p_full[rank * rank_size:(rank + 1) * rank_size]
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
                 state = self.state[p]
                 g_slice = grad_slices[idx]
@@ -72,5 +80,9 @@ class DistAdamW(torch.optim.Optimizer):
                 update = exp_avg.div(denom).mul_(step_size)
                 p_slice.add_(other=update, alpha=-1.0)
                 idx += 1
-                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+                all_reduce_futures.append(dist.all_gather_into_tensor(p_full, p_slice, async_op=True).get_future())
+                if pad:
+                    padded_params.append((p, p_full))
         torch.futures.collect_all(all_reduce_futures).wait()
+        for p, p_full in padded_params:
+            p.copy_(p_full[: p.shape[0]])
