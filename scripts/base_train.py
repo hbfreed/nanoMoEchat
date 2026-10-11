@@ -591,7 +591,7 @@ for step in range(start_step, num_iterations + 1):
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step - start_step + 1))  # EMA restarts on resume
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(world_tokens_per_fwdbwd / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
