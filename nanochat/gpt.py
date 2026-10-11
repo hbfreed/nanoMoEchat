@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import stk
 import stk.ops
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 from cut_cross_entropy import linear_cross_entropy
@@ -294,6 +295,12 @@ class MoEMLP(nn.Module):
         self.bias_update_speed = config.bias_update_speed
         self.bias_momentum = config.bias_momentum
         self.bias_kappa = config.bias_kappa
+        # False: SMEBU updates the bias inside forward (per micro-batch, local counts).
+        # True: forward only reports tokens_per_expert; the trainer sums them over
+        # micro-steps and ranks and calls GPT.update_expert_biases once per step, which
+        # keeps routing fixed within a step (needed for activation-checkpoint recompute)
+        # and the bias identical on every rank.
+        self.defer_bias_update = False
         if self.use_bias_balancing:
             self.register_buffer("expert_bias", torch.zeros(self.num_experts))
             # SMEBU momentum buffer — smooths bias updates over time
@@ -529,36 +536,8 @@ class MoEMLP(nn.Module):
                 selected_experts_flat
             )
 
-        if self.use_bias_balancing and self.training:
-            with torch.no_grad():
-                # SMEBU: Soft-clamped Momentum Expert Bias Updates (Arcee: Trinity, 2025)
-                n = tokens_per_expert.float()
-                n_bar = n.mean()
-
-                # 1. Normalized violation: how far each expert is from balanced
-                #    v_i = (n_bar - n_i) / n_bar
-                #    Positive = underloaded (needs more tokens), negative = overloaded
-                v = (n_bar - n) / n_bar
-
-                # 2. Soft clamp with tanh: near-balanced experts get tiny updates,
-                #    far-from-balanced get updates approaching ±1 (not the full ±1 hammer)
-                v_clamped = torch.tanh(self.bias_kappa * v)
-
-                # 3. Scale by learning rate
-                delta = self.bias_update_speed * v_clamped
-
-                # 4. Zero-center: subtract mean so updates sum to zero across experts.
-                #    This prevents the monotonic drift we were seeing — biases can only
-                #    move relative to each other, never all grow together.
-                delta = delta - delta.mean()
-
-                # 5. Momentum: smooth out noisy updates over time (like momentum SGD)
-                self.expert_bias_momentum.mul_(self.bias_momentum).add_(
-                    delta, alpha=1 - self.bias_momentum
-                )
-
-                # 6. Apply
-                self.expert_bias += self.expert_bias_momentum
+        if self.use_bias_balancing and self.training and not self.defer_bias_update:
+            self.update_bias(tokens_per_expert)
 
         if self.mlp_act == "swiglu":
             # A plan cached under torch.inference_mode() holds inference tensors
@@ -662,8 +641,41 @@ class MoEMLP(nn.Module):
             aux_loss["expert_bias_abs_max"] = self.expert_bias.abs().max()
             aux_loss["expert_bias_abs_mean"] = self.expert_bias.abs().mean()
             aux_loss["expert_bias_vector"] = self.expert_bias.detach().clone()
+            if self.defer_bias_update and self.training:
+                aux_loss["tokens_per_expert"] = tokens_per_expert.detach()
 
         return output, aux_loss, f_i
+
+    @torch.no_grad()
+    def update_bias(self, tokens_per_expert):
+        # SMEBU: Soft-clamped Momentum Expert Bias Updates (Arcee: Trinity, 2025)
+        n = tokens_per_expert.float()
+        n_bar = n.mean()
+
+        # 1. Normalized violation: how far each expert is from balanced
+        #    v_i = (n_bar - n_i) / n_bar
+        #    Positive = underloaded (needs more tokens), negative = overloaded
+        v = (n_bar - n) / n_bar
+
+        # 2. Soft clamp with tanh: near-balanced experts get tiny updates,
+        #    far-from-balanced get updates approaching ±1 (not the full ±1 hammer)
+        v_clamped = torch.tanh(self.bias_kappa * v)
+
+        # 3. Scale by learning rate
+        delta = self.bias_update_speed * v_clamped
+
+        # 4. Zero-center: subtract mean so updates sum to zero across experts.
+        #    This prevents the monotonic drift we were seeing — biases can only
+        #    move relative to each other, never all grow together.
+        delta = delta - delta.mean()
+
+        # 5. Momentum: smooth out noisy updates over time (like momentum SGD)
+        self.expert_bias_momentum.mul_(self.bias_momentum).add_(
+            delta, alpha=1 - self.bias_momentum
+        )
+
+        # 6. Apply
+        self.expert_bias += self.expert_bias_momentum
 
     def _sort_tokens_by_expert(self, selected_experts_flat):
         """Group token assignments by expert id."""
@@ -828,7 +840,18 @@ class Block(nn.Module):
             self.pre_mlp_norm = RMSNorm(config.n_embd, eps)
             self.post_mlp_norm = RMSNorm(config.n_embd, eps)
 
+    # set by GPT.set_activation_checkpointing: recompute this block's forward during
+    # backward instead of keeping its activations (inside the block, so FSDP2's
+    # per-block all-gather hooks stay outside the recomputed region)
+    activation_checkpointing = False
+
     def forward(self, x, cos_sin, window_size, kv_cache):
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                self._forward, x, cos_sin, window_size, kv_cache, use_reentrant=False)
+        return self._forward(x, cos_sin, window_size, kv_cache)
+
+    def _forward(self, x, cos_sin, window_size, kv_cache):
         if self.afmoe:
             x = x + self.post_attn_norm(self.attn(self.input_norm(x), cos_sin, window_size, kv_cache))
             mlp_x, aux_loss, f_i = self.mlp(self.pre_mlp_norm(x))
@@ -925,6 +948,10 @@ class GPT(nn.Module):
                 block.mlp._init_buffers()
             if hasattr(block.mlp, "init_params"):
                 block.mlp.init_params()
+            # SMEBU state starts at zero (to_empty leaves these as uninitialized memory)
+            for name in ("expert_bias", "expert_bias_momentum"):
+                if hasattr(block.mlp, name):
+                    getattr(block.mlp, name).zero_()
         # Cast all floating-point params to compute dtype (bf16 on Ampere+)
         # Integer buffers (expert_block_counts etc.) are unaffected
         if (
@@ -1005,13 +1032,56 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
+    def expert_layouts(self):
+        """{param: (expert dim, expert width)} for each MoE layer's w1/w3 (n_embd, E*width)
+        and w2 (E*width, n_embd): what per-expert Muon and expert-aligned FSDP sharding
+        need. Assumes one expert width per layer."""
+        layouts = {}
+        for block in self.transformer.h:
+            mlp = block.mlp
+            if not isinstance(mlp, MoEMLP):
+                continue
+            widths = {e - s for s, e in zip(mlp.expert_offsets[:-1], mlp.expert_offsets[1:])}
+            assert len(widths) == 1, f"per-expert layouts need one expert width, got {widths}"
+            width = widths.pop()
+            for name, dim in (("w1", 1), ("w3", 1), ("w2", 0)):
+                if hasattr(mlp, name):
+                    layouts[getattr(mlp, name)] = (dim, width)
+        return layouts
+
+    def set_activation_checkpointing(self, enabled=True):
+        """Recompute each block in backward. With bias balancing, call
+        set_defer_bias_updates() too, so recompute routes exactly like the forward."""
+        for block in self.transformer.h:
+            block.activation_checkpointing = enabled
+
+    def bias_balanced_mlps(self):
+        return [b.mlp for b in self.transformer.h if getattr(b.mlp, "use_bias_balancing", False)]
+
+    def set_defer_bias_updates(self, defer=True):
+        """See MoEMLP.defer_bias_update."""
+        for mlp in self.bias_balanced_mlps():
+            mlp.defer_bias_update = defer
+
+    @torch.no_grad()
+    def update_expert_biases(self, tokens_per_expert):
+        """One SMEBU step per bias-balanced layer from (layers, experts) token counts,
+        e.g. the forward's aux "tokens_per_expert" summed over micro-steps and ranks."""
+        mlps = self.bias_balanced_mlps()
+        assert tokens_per_expert.size(0) == len(mlps)
+        for mlp, counts in zip(mlps, tokens_per_expert):
+            mlp.update_bias(counts)
+
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
         stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004, fsdp=False,
+        muon_per_expert=False,
     ):
         """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
         fsdp: params are FSDP2-sharded (fully_shard); AdamW steps each rank's shards and
         FSDPMuon gathers each matrix to an owner rank for Newton-Schulz.
+        muon_per_expert: orthogonalize each MoE expert's matrices separately instead of
+        the concatenated (n_embd, E*width) matrices (see expert_layouts).
         stochastic_rounding: stochastically round bf16 weight updates.
         optim_state_dtype: dtype for momentum / Adam moments (default: the param's)."""
         model_dim = self.config.n_embd
@@ -1059,6 +1129,8 @@ class GPT(nn.Module):
             adamw_optimizer = torch.optim.AdamW(adam_groups, **adamw_kwargs, fused=True)
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, **precision_kwargs)
+        if muon_per_expert:
+            muon_kwargs["expert_layouts"] = self.expert_layouts()
         MuonFactory = FSDPMuon if fsdp else DistMuon if use_sharded else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
@@ -1100,6 +1172,7 @@ class GPT(nn.Module):
         expert_usage_count = 0
         expert_usage_per_layer = []
         expert_bias_per_layer = []
+        tokens_per_expert_per_layer = []
         for layer_idx, block in enumerate(self.transformer.h):
             window_size = self.window_sizes[layer_idx]
             x, aux_loss, f_i = block(x, cos_sin, window_size, kv_cache)
@@ -1116,8 +1189,11 @@ class GPT(nn.Module):
                 # expert_bias_vector is a raw tensor (not a loss) - collect per-layer, don't average
                 if "expert_bias_vector" in aux_loss:
                     expert_bias_per_layer.append(aux_loss["expert_bias_vector"])
+                if "tokens_per_expert" in aux_loss:
+                    tokens_per_expert_per_layer.append(aux_loss["tokens_per_expert"])
                 scalar_aux = {
-                    k: v for k, v in aux_loss.items() if k != "expert_bias_vector"
+                    k: v for k, v in aux_loss.items()
+                    if k not in ("expert_bias_vector", "tokens_per_expert")
                 }
                 if combined_aux_loss is None:
                     combined_aux_loss = {k: v.clone() for k, v in scalar_aux.items()}
@@ -1147,6 +1223,8 @@ class GPT(nn.Module):
             if combined_aux_loss is None:
                 combined_aux_loss = {}
             combined_aux_loss["expert_bias_per_layer"] = expert_bias_per_layer
+        if tokens_per_expert_per_layer:
+            combined_aux_loss["tokens_per_expert"] = torch.stack(tokens_per_expert_per_layer)
 
         x = self.transformer.norm(x) if afmoe else norm(x)
 

@@ -118,6 +118,8 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoint 
 parser.add_argument("--keep-last-n", type=int, default=-1, help="prune old checkpoints, keeping only the last N unprotected saves (-1 = keep all)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 parser.add_argument("--profile-step", type=int, default=-1, help="profile this step: per-phase wall time and GPU time by kernel type (rank 0), plus a chrome trace in the checkpoint dir's parent")
+parser.add_argument("--muon-per-expert", action="store_true", help="Muon orthogonalizes each MoE expert's matrices separately (with --fsdp, experts are sharded whole, so no optimizer communication)")
+parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to fit bigger micro-batches")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
@@ -224,6 +226,11 @@ with torch.device("meta"):
     model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
+# SMEBU bias updates once per step from counts summed over micro-steps and ranks (below),
+# so routing is fixed within a step and the bias is identical on every rank
+model.set_defer_bias_updates(True)
+if args.activation_checkpointing:
+    model.set_activation_checkpointing(True)
 if args.fsdp:
     # FSDP2: each block (and the root: embeddings, lm_head, final norm) is all-gathered
     # for its forward/backward and resharded after; grads are reduce-scattered each
@@ -231,8 +238,13 @@ if args.fsdp:
     from torch.distributed.fsdp import fully_shard
     assert ddp, "--fsdp needs torchrun with more than one rank"
     assert not args.fp32_master_weights, "--fsdp with fp32 master weights is not supported yet"
+    from torch.distributed.tensor import Shard
+    # per-expert Muon: shard expert matrices along their expert dim so every rank holds
+    # whole experts (w1/w3 are (n_embd, E*width): dim 1; w2 already shards whole experts on dim 0)
+    layouts = model.expert_layouts() if args.muon_per_expert else {}
+    placement = lambda p: Shard(layouts[p][0]) if p in layouts else None
     for block in model.transformer.h:
-        fully_shard(block)
+        fully_shard(block, shard_placement_fn=placement)
     fully_shard(model)
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
 model = torch.compile(model, dynamic=False)
@@ -288,6 +300,7 @@ optimizers = model.setup_optimizers(
     optim_state_dtype=torch.bfloat16 if args.bf16_optim_state else None,
     norm_lr=args.norm_lr,
     fsdp=args.fsdp,
+    muon_per_expert=args.muon_per_expert,
 )
 adamw_optimizer, muon_optimizer = optimizers
 
@@ -304,8 +317,8 @@ if args.fsdp:  # these run the model on rank 0 only, or compare replicas FSDP do
         if getattr(args, flag) > 0:
             print0(f"--fsdp: disabling --{flag.replace('_', '-')} (not supported with FSDP yet)")
             setattr(args, flag, -1)
-# SMEBU expert biases update from each rank's local token counts, so they drift apart
-# across ranks under any multi-GPU setup; average them after every step.
+# SMEBU expert biases: updated from globally summed counts, so identical on every rank;
+# the replica check covers them too.
 expert_bias_buffers = [
     b for name, b in orig_model.named_buffers()
     if name.endswith(("expert_bias", "expert_bias_momentum"))
@@ -564,8 +577,12 @@ for step in range(start_step, num_iterations + 1):
         prof.__enter__()
     synchronize()
     t0 = time.time()
+    expert_counts = None
     for micro_step in range(grad_accum_steps):
         logits, loss, combined_aux_loss = model(x, y)
+        if combined_aux_loss is not None and "tokens_per_expert" in combined_aux_loss:
+            c = combined_aux_loss["tokens_per_expert"].long()
+            expert_counts = c if expert_counts is None else expert_counts + c
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -589,8 +606,11 @@ for step in range(start_step, num_iterations + 1):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if expert_counts is not None:
+        if ddp:
+            dist.all_reduce(expert_counts, op=dist.ReduceOp.SUM)
+        orig_model.update_expert_biases(expert_counts)
     if ddp:
-        all_reduce_avg_(expert_bias_buffers)
         if args.replica_check_every > 0 and step % args.replica_check_every == 0:
             check_replicas_(step)
     synchronize()

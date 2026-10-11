@@ -37,6 +37,19 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
+def orthogonalize(g: Tensor, steps: int, layout=None) -> Tensor:
+    """Muon's update direction for g: Newton-Schulz orthogonalized, times the aspect-ratio
+    scale sqrt(max(1, rows/cols)). layout=(dim, width) treats each width-sized slice of g
+    along dim as its own matrix (one per MoE expert: w1/w3 are (n_embd, E*width) with
+    dim=1, w2 is (E*width, n_embd) with dim=0) and orthogonalizes them as a batch."""
+    if layout is None:
+        return zeropower_via_newtonschulz5(g, steps) * max(1.0, g.size(-2) / g.size(-1)) ** 0.5
+    dim, width = layout
+    x = g.reshape(g.size(0), -1, width).transpose(0, 1) if dim == 1 else g.reshape(-1, width, g.size(1))
+    u = zeropower_via_newtonschulz5(x, steps) * max(1.0, x.size(-2) / x.size(-1)) ** 0.5
+    return u.transpose(0, 1).reshape(g.shape) if dim == 1 else u.reshape(g.shape)
+
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -60,12 +73,15 @@ class Muon(torch.optim.Optimizer):
         ns_steps: The number of Newton-Schulz iteration steps to use.
         stochastic_rounding: stochastically round bf16 weight updates.
         state_dtype: dtype for the momentum buffer (default: the grad's dtype).
+        expert_layouts: {param: (dim, width)} for MoE expert matrices to orthogonalize
+            per expert (see orthogonalize); other params are orthogonalized whole.
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
-                 stochastic_rounding=False, state_dtype=None):
+                 stochastic_rounding=False, state_dtype=None, expert_layouts=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
+        self.expert_layouts = expert_layouts or {}
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -86,9 +102,8 @@ class Muon(torch.optim.Optimizer):
                 buf: Tensor = state["momentum_buffer"]
                 buf.lerp_(g.to(buf.dtype), 1 - group["momentum"])
                 g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                apply_update_(p, g, -group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5,
-                              self.stochastic_rounding)
+                g = orthogonalize(g, group["ns_steps"], self.expert_layouts.get(p))
+                apply_update_(p, g, -group["lr"], self.stochastic_rounding)
 
 
 class DistMuon(torch.optim.Optimizer):
@@ -114,10 +129,11 @@ class DistMuon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5,
-                 stochastic_rounding: bool = False, state_dtype=None):
+                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
+        self.expert_layouts = expert_layouts or {}
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
@@ -184,9 +200,8 @@ class DistMuon(torch.optim.Optimizer):
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
                     g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                    scale = (max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
-                    apply_update_(p, g, -group["lr"] * scale, self.stochastic_rounding)
+                    g = orthogonalize(g, group["ns_steps"], self.expert_layouts.get(p))
+                    apply_update_(p, g, -group["lr"], self.stochastic_rounding)
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
                 ag_output = params[base_i:base_i + world_size]
@@ -217,22 +232,50 @@ class FSDPMuon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5,
-                 stochastic_rounding: bool = False, state_dtype=None):
+                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
+        self.expert_layouts = expert_layouts or {}
         params = list(params)
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
-        shapes = sorted({tuple(p.shape) for p in params})
-        param_groups = [dict(params=[p for p in params if tuple(p.shape) == s]) for s in shapes]
+        world_size = dist.get_world_size()
+
+        def expert_aligned(p):
+            """Per-expert param sharded along its expert dim into whole experts on every
+            rank: its update needs no communication at all."""
+            layout = self.expert_layouts.get(p)
+            if layout is None or not hasattr(p, "placements"):
+                return False
+            dim, width = layout
+            sizes = [c.size(0) for c in torch.empty(p.size(dim)).chunk(world_size)]
+            return p.placements[0].dim == dim and all(n % width == 0 for n in sizes)
+
+        self.local_params = [p for p in params if expert_aligned(p)]
+        gathered = [p for p in params if not expert_aligned(p)]
+        assert all(p.placements[0].dim == 0 for p in gathered if hasattr(p, "placements"))
+        shapes = sorted({tuple(p.shape) for p in gathered})
+        param_groups = [dict(params=[p for p in gathered if tuple(p.shape) == s]) for s in shapes]
+        if self.local_params:
+            param_groups.append(dict(params=self.local_params, local=True))
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self):
         rank, world_size = dist.get_rank(), dist.get_world_size()
+        # 0. expert-aligned shards: whole experts locally, so no communication
+        for group in self.param_groups:
+            if not group.get("local"):
+                continue
+            for p in group["params"]:
+                g = self._nesterov_(p, group)
+                u = orthogonalize(g, group["ns_steps"], self.expert_layouts[p])
+                apply_update_(_local(p), u, -group["lr"], self.stochastic_rounding)
         # 1. momentum + Nesterov on local shards, then all_to_all the shards to each owner
         pending = []
         for group in self.param_groups:
+            if group.get("local"):
+                continue
             params = group["params"]
             # FSDP2 shards with torch.chunk, which can return fewer chunks; the rest are empty
             rows = [c.size(0) for c in torch.empty(params[0].size(0)).chunk(world_size)]
@@ -240,16 +283,7 @@ class FSDPMuon(torch.optim.Optimizer):
             cols = params[0].size(1)
             for base_i in range(0, len(params), world_size):
                 chunk = params[base_i:base_i + world_size]
-                send = []
-                for p in chunk:
-                    g = _local(p.grad)
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
-                    buf = state["momentum_buffer"]
-                    buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
-                    g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf.to(g.dtype)
-                    send.append(g.contiguous())
+                send = [self._nesterov_(p, group).contiguous() for p in chunk]
                 dtype, device = send[0].dtype, send[0].device
                 send += [torch.empty(0, cols, dtype=dtype, device=device)] * (world_size - len(chunk))
                 owns = base_i + rank < len(params)
@@ -263,7 +297,7 @@ class FSDPMuon(torch.optim.Optimizer):
             dtype, device, cols = recv[0].dtype, recv[0].device, recv[0].size(1)
             if rank < len(chunk):
                 full = torch.cat(recv)
-                u = zeropower_via_newtonschulz5(full, steps=group["ns_steps"])
+                u = orthogonalize(full, group["ns_steps"], self.expert_layouts.get(chunk[rank]))
                 send = [s.contiguous() for s in u.split(rows)]
             else:
                 send = [torch.empty(0, cols, dtype=dtype, device=device) for _ in rows]
@@ -275,5 +309,14 @@ class FSDPMuon(torch.optim.Optimizer):
         for group, chunk, recv_u, work in updates:
             work.wait()
             for p, u in zip(chunk, recv_u):
-                scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-                apply_update_(_local(p), u, -group["lr"] * scale, self.stochastic_rounding)
+                apply_update_(_local(p), u, -group["lr"], self.stochastic_rounding)
+
+    def _nesterov_(self, p, group):
+        """Momentum update on p's local shard; returns the (Nesterov) update direction."""
+        g = _local(p.grad)
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
+        buf = state["momentum_buffer"]
+        buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
+        return g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf.to(g.dtype)
