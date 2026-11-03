@@ -122,6 +122,9 @@ parser.add_argument("--muon-per-expert", action=argparse.BooleanOptionalAction, 
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to fit bigger micro-batches")
 parser.add_argument("--checkpoint-layers", type=int, default=-1, help="with --activation-checkpointing: checkpoint only the first N blocks (-1: all), trading memory for less recompute")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
+parser.add_argument("--fsdp-keep-weights", action="store_true", help="with --fsdp: keep each block's gathered weights from forward to backward instead of gathering them again (reshard_after_forward=False). Costs about 4/3 bytes per parameter per rank. 3.74B total on 3x3090: 2788 -> 2335 ms/step")
+parser.add_argument("--fsdp-copy-engine", action=argparse.BooleanOptionalAction, default=True, help="with --fsdp: all-gather through the GPUs' copy engines (symmetric memory, NCCL_CTA_POLICY=2), so communication stops taking SMs from compute. 3.74B total on 3x3090 with --fsdp-keep-weights: 2350 -> 2120 ms/step")
+parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"], help="megablocks backend for swiglu experts: triton (any GPU) or cute (CuTe DSL, Ampere; 1.5-3%% faster end to end on 3x3090)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
 if args.tokenizer:  # get_tokenizer() everywhere, incl. the dataloaders, reads this
@@ -132,6 +135,9 @@ args.expert_sizes = [tuple(x) for x in args.expert_sizes]
 # -----------------------------------------------------------------------------
 
 # Compute init
+if args.fsdp and args.fsdp_copy_engine:
+    # zero-CTA collectives; NCCL reads this when it creates the communicators
+    os.environ.setdefault("NCCL_CTA_POLICY", "2")
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 torch.manual_seed(args.seed)
@@ -232,10 +238,12 @@ model.init_weights()
 model.set_defer_bias_updates(True)
 if args.activation_checkpointing:
     model.set_activation_checkpointing(True, None if args.checkpoint_layers < 0 else args.checkpoint_layers)
+model.set_moe_backend(args.moe_backend)
 if args.fsdp:
     # FSDP2: each block (and the root: embeddings, lm_head, final norm) is all-gathered
-    # for its forward/backward and resharded after; grads are reduce-scattered each
-    # backward. Buffers (expert biases) stay replicated.
+    # for its forward/backward and resharded after (after backward only, with
+    # --fsdp-keep-weights); grads are reduce-scattered each backward. Buffers (expert
+    # biases) stay replicated.
     from torch.distributed.fsdp import fully_shard
     assert ddp, "--fsdp needs torchrun with more than one rank"
     assert not args.fp32_master_weights, "--fsdp with fp32 master weights is not supported yet"
@@ -243,10 +251,18 @@ if args.fsdp:
     # per-expert Muon: shard expert matrices along their expert dim so every rank holds
     # whole experts (w1/w3 are (n_embd, E*width): dim 1; w2 already shards whole experts on dim 0)
     layouts = model.expert_layouts() if args.muon_per_expert else {}
+    for p, (dim, width) in layouts.items():
+        n = p.shape[dim] // width
+        assert n % ddp_world_size == 0, (
+            f"--fsdp with per-expert Muon gives each rank whole experts, so the {n} experts of "
+            f"width {width} must split evenly over {ddp_world_size} ranks"
+        )
     placement = lambda p: Shard(layouts[p][0]) if p in layouts else None
-    for block in model.transformer.h:
-        fully_shard(block, shard_placement_fn=placement)
-    fully_shard(model)
+    reshard = not args.fsdp_keep_weights
+    for module in (*model.transformer.h, model):  # the root last
+        fully_shard(module, shard_placement_fn=placement, reshard_after_forward=reshard)
+        if args.fsdp_copy_engine:
+            module.set_symm_mem_for_comm()
     del layouts, placement  # they reference the unsharded params; keeping them keeps a full copy alive
     print0(f"FSDP: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated per rank after sharding")
 orig_model = model  # original, uncompiled model, for saving raw model state_dict

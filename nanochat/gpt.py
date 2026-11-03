@@ -301,6 +301,10 @@ class MoEMLP(nn.Module):
         # keeps routing fixed within a step (needed for activation-checkpoint recompute)
         # and the bias identical on every rank.
         self.defer_bias_update = False
+        # megablocks backend for the swiglu experts' GEMMs: "triton" (any GPU) or
+        # "cute" (CuTe DSL, Ampere, needs megablocks[cute]). Speed only, so it is a
+        # runtime setting (GPT.set_moe_backend), not part of the config or checkpoint.
+        self.moe_backend = "triton"
         if self.use_bias_balancing:
             self.register_buffer("expert_bias", torch.zeros(self.num_experts))
             # SMEBU momentum buffer — smooths bias updates over time
@@ -561,6 +565,7 @@ class MoEMLP(nn.Module):
                 self.w1.to(x_flat.dtype),
                 self.w3.to(x_flat.dtype),
                 self.w2.to(x_flat.dtype),
+                down_proj_backend=self.moe_backend,
             )
         else:
             # Compute bins for gather/scatter
@@ -1068,6 +1073,15 @@ class GPT(nn.Module):
         n = len(self.transformer.h) if num_layers is None else num_layers
         for i, block in enumerate(self.transformer.h):
             block.activation_checkpointing = enabled and i < n
+
+    def set_moe_backend(self, backend):
+        """megablocks backend for the swiglu experts: "triton" or "cute" (see MoEMLP)."""
+        assert backend in ("triton", "cute"), backend
+        if backend == "cute":  # fail here rather than inside the first step
+            import megablocks.backend.cute_down_proj  # noqa: F401
+        for block in self.transformer.h:
+            if isinstance(block.mlp, MoEMLP):
+                block.mlp.moe_backend = backend
 
     def bias_balanced_mlps(self):
         return [b.mlp for b in self.transformer.h if getattr(b.mlp, "use_bias_balancing", False)]
