@@ -6,10 +6,20 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 
+from nanochat.newton_schulz import newton_schulz
 from nanochat.precision import apply_update_
 
-@torch.compile
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """Newton-Schulz orthogonalization of G (or a batch of matrices). On CUDA the Triton
+    kernels in newton_schulz.py run it (474 -> 266 ms per per-expert Muon step at d=512 with
+    128x512 experts); elsewhere the torch version below."""
+    if G.is_cuda:
+        return newton_schulz(G, steps)
+    return _zeropower_torch(G, steps)
+
+
+@torch.compile
+def _zeropower_torch(G: Tensor, steps: int) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
