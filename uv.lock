@@ -54,6 +54,12 @@ conflicts = [[
     { package = "nanochat", extra = "gpu" },
 ]]
 
+[[manifest.dependency-metadata]]
+name = "megablocks"
+version = "0.11.0.dev0"
+requires-dist = ["torch>=2.11.0,<2.13", "stanford-stk==0.7.1 ; extra == 'stk'", "nvidia-cutlass-dsl>=4.6.0,<4.7 ; extra == 'cute'", "apache-tvm-ffi>=0.1.0,<0.2 ; extra == 'cute'"]
+provides-extras = ["stk", "cute"]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
@@ -1531,12 +1537,8 @@ wheels = [
 [[package]]
 name = "megablocks"
 version = "0.11.0.dev0"
-source = { git = "https://github.com/hbfreed/megablocks-variable.git#3965896880710fa43765ceb4766d061b912dd303" }
+source = { git = "https://github.com/hbfreed/megablocks-variable.git?rev=d8e480b754926e12664210bf34622949ad4deba0#d8e480b754926e12664210bf34622949ad4deba0" }
 dependencies = [
-    { name = "einops" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "stanford-stk" },
     { name = "torch", version = "2.12.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
     { name = "torch", version = "2.12.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu') or (extra != 'extra-8-nanochat-cpu' and extra != 'extra-8-nanochat-gpu')" },
     { name = "torch", version = "2.12.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-8-nanochat-cpu') or (extra == 'extra-8-nanochat-cpu' and extra == 'extra-8-nanochat-gpu')" },
@@ -1777,7 +1779,7 @@ requires-dist = [
     { name = "files-to-prompt", specifier = ">=0.6" },
     { name = "flash-attn", marker = "extra == 'gpu'", specifier = "==2.8.3.post1" },
     { name = "matplotlib", specifier = ">=3.10.8" },
-    { name = "megablocks", extras = ["cute"], git = "https://github.com/hbfreed/megablocks-variable.git" },
+    { name = "megablocks", extras = ["cute"], git = "https://github.com/hbfreed/megablocks-variable.git?rev=d8e480b754926e12664210bf34622949ad4deba0" },
     { name = "numpy", specifier = "==1.26.4" },
     { name = "psutil", specifier = ">=7.1.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },

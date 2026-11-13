@@ -12,7 +12,7 @@ dependencies = [
     "files-to-prompt>=0.6",
     "matplotlib>=3.10.8",
     # cute: the CuTe DSL expert backend (base_train --moe-backend=cute, Ampere)
-    "megablocks[cute] @ git+https://github.com/hbfreed/megablocks-variable.git",
+    "megablocks[cute] @ git+https://github.com/hbfreed/megablocks-variable.git@d8e480b754926e12664210bf34622949ad4deba0",
     "numpy==1.26.4",
     "psutil>=7.1.0",
     "python-dotenv>=1.2.1",
@@ -96,6 +96,19 @@ conflicts = [
 # (off by default in the fork). Build it against the exact torch we run with;
 # needs a CUDA 13 nvcc on PATH or CUDA_HOME, 13.2 or newer with glibc 2.43
 # (13.0's math headers clash with glibc's new rsqrt).
+# megablocks' version is dynamic, and match-runtime needs static metadata to lock;
+# this mirrors megablocks' pyproject (stk is an extra since megablocks PR #11).
+[[tool.uv.dependency-metadata]]
+name = "megablocks"
+version = "0.11.0.dev0"
+requires-dist = [
+    "torch>=2.11.0,<2.13",
+    "stanford-stk==0.7.1; extra == 'stk'",
+    "nvidia-cutlass-dsl>=4.6.0,<4.7; extra == 'cute'",
+    "apache-tvm-ffi>=0.1.0,<0.2; extra == 'cute'",
+]
+provides-extras = ["stk", "cute"]
+
 [tool.uv.extra-build-dependencies]
 megablocks = [{ requirement = "torch", match-runtime = true }]
 flash-attn = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "psutil", "einops"]

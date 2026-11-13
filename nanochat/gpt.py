@@ -438,6 +438,8 @@ class MoEMLP(nn.Module):
     def _init_buffers(self):
         """Reinitialize non-persistent buffers after to_empty from meta device."""
         device = self.w1.device
+        if self.mlp_act == "swiglu":
+            self._build_grouped_plan(device)
 
         self.expert_size_blocks.copy_(
             torch.tensor(
@@ -490,9 +492,11 @@ class MoEMLP(nn.Module):
                 torch.tensor(valid_indices, dtype=torch.long, device=device)
             )
 
-    # Disable torch.compile tracing for MoE - triton kernels (stk.ops.row_indices etc)
-    # can't handle FakeTensors used during compile tracing
-    @torch.compiler.disable
+    def _build_grouped_plan(self, device):
+        self._grouped_plan = FusedMoEPlan(
+            self.expert_widths, self.config.n_embd, device, block_n=self.block_size
+        )
+
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
 
@@ -532,8 +536,12 @@ class MoEMLP(nn.Module):
         if self.mlp_act == "swiglu":
             # The grouped path does its own counting-sort routing internally;
             # only the per-expert counts are needed here (SMEBU + logging).
-            tokens_per_expert = ops.histogram(
-                selected_experts_flat, self.num_experts
+            # scatter_add rather than megablocks' Triton histogram, so compile
+            # fuses it into the routing code; integer adds are exact.
+            tokens_per_expert = torch.zeros(
+                self.num_experts, dtype=torch.int32, device=x.device
+            ).scatter_add_(
+                0, selected_experts_flat, torch.ones_like(selected_experts_flat, dtype=torch.int32)
             )
         else:
             bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(
@@ -544,18 +552,16 @@ class MoEMLP(nn.Module):
             self.update_bias(tokens_per_expert)
 
         if self.mlp_act == "swiglu":
-            # A plan cached under torch.inference_mode() holds inference tensors
-            # whose in-place scratch updates are illegal outside it (and vice
-            # versa), so rebuild whenever the mode changed since it was built.
-            if (
-                self._grouped_plan is None
-                or self._grouped_plan.counts.is_inference()
+            # _init_buffers builds the plan outside any compiled region. A plan
+            # built under torch.inference_mode() holds inference tensors whose
+            # in-place scratch updates are illegal outside it, so eager code
+            # rebuilds it when the mode changed (compiled code never sees one).
+            if self._grouped_plan is None or (
+                not torch.compiler.is_compiling()
+                and self._grouped_plan.counts.is_inference()
                 != torch.is_inference_mode_enabled()
             ):
-                self._grouped_plan = FusedMoEPlan(
-                    self.expert_widths, x_flat.shape[-1], x_flat.device,
-                    block_n=self.block_size,
-                )
+                self._build_grouped_plan(x_flat.device)
             x_permuted = grouped_moe(
                 x_flat,
                 top_k_weights_flat,
@@ -857,27 +863,13 @@ class Block(nn.Module):
         return self._forward(x, cos_sin, window_size, kv_cache)
 
     def _forward(self, x, cos_sin, window_size, kv_cache):
-        x, h = self._attn_sublayer(x, cos_sin, window_size, kv_cache)
-        mlp_x, aux_loss, f_i = self.mlp(h)
-        return self._mlp_residual(x, mlp_x), aux_loss, f_i
-
-    # The MLP sits between these two because MoEMLP.forward is torch.compiler.disable'd:
-    # compile_pieces() compiles them separately, so a checkpointed block still runs
-    # compiled code (Dynamo cannot compile a checkpointed region with a graph break inside)
-    def _attn_sublayer(self, x, cos_sin, window_size, kv_cache):
-        """Attention residual; returns (x, normed MLP input)."""
         if self.afmoe:
             x = x + self.post_attn_norm(self.attn(self.input_norm(x), cos_sin, window_size, kv_cache))
-            return x, self.pre_mlp_norm(x)
+            mlp_x, aux_loss, f_i = self.mlp(self.pre_mlp_norm(x))
+            return x + self.post_mlp_norm(mlp_x), aux_loss, f_i
         x = x + self.attn(norm(x), cos_sin, window_size, kv_cache)
-        return x, norm(x)
-
-    def _mlp_residual(self, x, mlp_x):
-        return x + (self.post_mlp_norm(mlp_x) if self.afmoe else mlp_x)
-
-    def compile_pieces(self):
-        self._attn_sublayer = torch.compile(self._attn_sublayer, dynamic=False)
-        self._mlp_residual = torch.compile(self._mlp_residual, dynamic=False)
+        mlp_x, aux_loss, f_i = self.mlp(norm(x))
+        return x + mlp_x, aux_loss, f_i
 
 
 class GPT(nn.Module):

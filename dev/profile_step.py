@@ -119,11 +119,7 @@ if args.activation_checkpointing:
 flops_per_token = model.estimate_flops()
 n_params = sum(p.numel() for p in model.parameters())
 if not args.no_compile:
-    if args.activation_checkpointing:  # as base_train
-        for block in model.transformer.h:
-            block.compile_pieces()
-    else:
-        model = torch.compile(model, dynamic=False)
+    model = torch.compile(model, dynamic=False)
 
 B, T = args.device_batch_size, args.max_seq_len
 x = torch.randint(0, args.vocab_size, (B, T), device=device)

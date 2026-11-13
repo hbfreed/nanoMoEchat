@@ -143,3 +143,53 @@ def test_fsdp_muon_per_expert_matches_single_gpu():
         opt.step()
     for p_ref, p_sh in zip(ref.mats, sharded.mats):
         assert _rel_err(p_sh.full_tensor(), p_ref) < 1e-3
+
+
+def test_fsdp_compiled_blocks_match_eager():
+    """base_train with --fsdp compiles each block whole, activation checkpointing and the
+    grouped MoE custom op included. One training step must match the eager FSDP model:
+    same loss and gradients up to the rounding compile's fusions change."""
+    from torch.distributed.fsdp import fully_shard
+
+    from nanochat.gpt import GPT, GPTConfig
+
+    _setup()
+    world, rank = dist.get_world_size(), dist.get_rank()
+    cfg = GPTConfig(sequence_len=128, vocab_size=512, n_layer=2, n_head=2, n_kv_head=2,
+                    n_embd=256, window_pattern="L", expert_sizes=[(2 * world, 256)],
+                    num_active_experts=2, mlp_act="swiglu")
+
+    def build(compiled):
+        with torch.device("meta"):
+            model = GPT(cfg)
+        model.to_empty(device="cuda")
+        torch.manual_seed(0)
+        model.init_weights()
+        model.set_activation_checkpointing(True)
+        for module in (*model.transformer.h, model):
+            fully_shard(module)
+        if compiled:
+            for block in model.transformer.h:
+                block.compile(dynamic=False)
+        return model
+
+    gen = torch.Generator("cuda").manual_seed(rank)  # each rank its own batch, as in training
+    x = torch.randint(0, cfg.vocab_size, (4, cfg.sequence_len), device="cuda", generator=gen)
+    y = torch.randint(0, cfg.vocab_size, (4, cfg.sequence_len), device="cuda", generator=gen)
+    results = []
+    for compiled in (False, True):
+        model = build(compiled)
+        for _ in range(2):  # the second step runs the compiled code warm
+            model.zero_grad(set_to_none=True)
+            _, loss, _ = model(x, y)
+            loss.backward()
+        grads = {n: p.grad.full_tensor() for n, p in model.named_parameters() if p.grad is not None}
+        results.append((loss.detach(), grads))
+    (loss_e, grads_e), (loss_c, grads_c) = results
+    assert _rel_err(loss_c, loss_e) < 2e-3, (loss_c.item(), loss_e.item())
+    assert grads_c.keys() == grads_e.keys()
+    for name in grads_e:
+        if not grads_e[name].any():  # zero-initialized output projections block some grads
+            assert not grads_c[name].any(), name
+            continue
+        assert _rel_err(grads_c[name], grads_e[name]) < 5e-2, (name, _rel_err(grads_c[name], grads_e[name]))

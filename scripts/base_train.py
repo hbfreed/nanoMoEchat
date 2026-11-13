@@ -266,11 +266,11 @@ if args.fsdp:
     del layouts, placement  # they reference the unsharded params; keeping them keeps a full copy alive
     print0(f"FSDP: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated per rank after sharding")
 orig_model = model  # original, uncompiled model, for saving raw model state_dict
-if args.fsdp or args.activation_checkpointing:
-    # compiling the root graph-breaks at every FSDP2 hook and at the (compile-disabled)
-    # MoE inside each checkpointed block, leaving blocks eager: compile the pieces instead
+if args.fsdp:
+    # compiling the root graph-breaks at every FSDP2 hook: compile each block instead,
+    # which keeps the hooks outside the compiled code (checkpointing included)
     for block in orig_model.transformer.h:
-        block.compile_pieces()
+        block.compile(dynamic=False)
 else:
     model = torch.compile(model, dynamic=False)
 total_params = sum(p.numel() for p in model.parameters())
