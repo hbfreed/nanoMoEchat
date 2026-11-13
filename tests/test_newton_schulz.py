@@ -13,17 +13,21 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _torch_fused(G, steps=5):
-    """The iteration with each product rounded once from fp32, like the kernel."""
+def _torch_fused(G, steps=5, fp32_out=False):
+    """The iteration with each product rounded once from fp32, like the kernel, and the
+    normalization s = 1/|X| folded into the first iteration: A = s^2 X X^T, X1 = s (B X + a X).
+    fp32_out leaves the last product unrounded."""
     from nanochat.newton_schulz import A_COEF, B_COEF, C_COEF
     X = G.bfloat16()
     tall = X.size(-2) > X.size(-1)
     X = X.mT if tall else X
-    X = X / (X.float().norm(dim=(-2, -1), keepdim=True) + 1e-7).to(X.dtype)
-    for _ in range(steps):
-        A = (X.float() @ X.float().mT).bfloat16()
+    s = 1 / (X.float().norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for i in range(steps):
+        f = s if i == 0 else 1.0
+        A = (f * f * (X.float() @ X.float().mT)).bfloat16()
         B = (C_COEF * (A.float() @ A.float()) + B_COEF * A.float()).bfloat16()
-        X = (B.float() @ X.float() + A_COEF * X.float()).bfloat16()
+        X = f * (B.float() @ X.float() + A_COEF * X.float())
+        X = X if fp32_out and i == steps - 1 else X.bfloat16()
     return X.mT if tall else X
 
 
@@ -59,8 +63,8 @@ def test_strided_and_symmetric_are_exact():
 @pytest.mark.parametrize("state_dtype", [None, torch.float32])
 def test_muon_step_matches_per_parameter_loop(state_dtype):
     """Muon.step batches same-shape matrices through Newton-Schulz and runs momentum and the
-    update as multi-tensor ops; it must match the original per-parameter loop bitwise."""
-    from nanochat.muon import Muon, orthogonalize
+    update as multi-tensor ops; it must match a per-parameter loop bitwise."""
+    from nanochat.muon import Muon, orthogonalize, orthogonalize_add_
     from nanochat.precision import apply_update_
 
     torch.manual_seed(0)
@@ -84,6 +88,60 @@ def test_muon_step_matches_per_parameter_loop(state_dtype):
                 buf = bufs.setdefault(p, torch.zeros_like(g, dtype=state_dtype or g.dtype))
                 buf.lerp_(g.to(buf.dtype), 1 - 0.95)
                 g = g.lerp_(buf.to(g.dtype), 0.95)
-                apply_update_(p, orthogonalize(g, 5, ref_layouts.get(p)), -0.02, False)
+                if p in ref_layouts:  # expert matrices: the update is fused into the last product
+                    orthogonalize_add_(p, g, 5, -0.02, ref_layouts[p])
+                else:
+                    apply_update_(p, orthogonalize(g, 5), -0.02, False)
     for a, b in zip(new, ref):
         assert torch.equal(a, b)
+
+
+def _ulp(x):
+    """Spacing of bf16 values at |x|."""
+    x = x.float().abs().clamp_min(torch.finfo(torch.bfloat16).tiny)
+    return torch.exp2(torch.floor(torch.log2(x)) - 7)
+
+
+@pytest.mark.parametrize("shape,layout", [((256, 4 * 128), (1, 128)), ((4 * 128, 256), (0, 128)),
+                                          ((4 * 64, 128), (0, 64)), ((256, 256), None),
+                                          ((64, 256), None), ((256, 64), None)])
+def test_fused_update_matches_unfused(shape, layout):
+    """orthogonalize_add_ adds the last Newton-Schulz product into p in fp32 and rounds once;
+    the unfused path rounds the update to bf16 first. Same products otherwise, so the two
+    agree to one bf16 rounding of p, and the fused one is the correctly rounded
+    p + alpha * u of the fp32 update (up to fp32 rounding of the epilogue)."""
+    from nanochat.muon import orthogonalize, orthogonalize_add_
+    from nanochat.precision import apply_update_
+    torch.manual_seed(0)
+    p0 = (torch.randn(shape, device="cuda") * 0.05).bfloat16()
+    g = torch.randn(shape, device="cuda").bfloat16()
+    lr = -0.02
+    fused, unfused, u32 = p0.clone(), p0.clone(), torch.zeros(shape, device="cuda")
+    orthogonalize_add_(fused, g, 5, lr, layout)
+    apply_update_(unfused, orthogonalize(g, 5, layout), lr, False)
+    orthogonalize_add_(u32, g, 5, 1.0, layout)  # the unrounded update, in fp32
+    exact = p0.float() + lr * u32
+    assert torch.equal(orthogonalize(g, 5, layout), u32.bfloat16())
+    # rounding u to bf16 moves the unfused sum by up to half a step at |lr * u|, which can
+    # exceed a step of the sum where p and lr * u cancel; the sum is at most 2 * scale
+    scale = torch.maximum(p0.float().abs(), (lr * u32).abs())
+    assert ((fused.float() - unfused.float()).abs() <= _ulp(2 * scale)).all()
+    assert ((fused.float() - exact).abs() <= 0.5 * _ulp(exact)).all()
+    assert (fused.float() - exact).norm() <= (unfused.float() - exact).norm()
+
+
+def test_fused_update_stochastic_rounding_falls_back():
+    """stochastic_rounding keeps the unfused path: p's expected step is alpha * u even where
+    it is below half a bf16 step (round-to-nearest would leave p unchanged)."""
+    from nanochat.muon import orthogonalize, orthogonalize_add_
+    torch.manual_seed(0)
+    g = torch.randn(256, 4 * 128, device="cuda").bfloat16()
+    u = orthogonalize(g, 5, (1, 128)).float()
+    p = torch.ones(256, 4 * 128, device="cuda").bfloat16()
+    step = torch.zeros_like(u)
+    for _ in range(16):
+        q = p.clone()
+        orthogonalize_add_(q, g, 5, -1e-3, (1, 128), stochastic=True)
+        step += (q.float() - 1.0) / 16
+    coef = (step * u).sum() / (u * u).sum()  # least-squares fit of step = coef * u
+    assert abs(coef.item() + 1e-3) < 1e-4

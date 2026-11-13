@@ -47,17 +47,44 @@ def _zeropower_torch(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
+def _per_expert(t: Tensor, layout) -> Tensor:
+    """(E, rows, cols) view of a per-expert matrix (see orthogonalize); no copy."""
+    dim, width = layout
+    return t.reshape(t.size(0), -1, width).transpose(0, 1) if dim == 1 else t.reshape(-1, width, t.size(1))
+
+
+def _aspect(x: Tensor) -> float:
+    return max(1.0, x.size(-2) / x.size(-1)) ** 0.5
+
+
 def orthogonalize(g: Tensor, steps: int, layout=None) -> Tensor:
     """Muon's update direction for g: Newton-Schulz orthogonalized, times the aspect-ratio
     scale sqrt(max(1, rows/cols)). layout=(dim, width) treats each width-sized slice of g
     along dim as its own matrix (one per MoE expert: w1/w3 are (n_embd, E*width) with
     dim=1, w2 is (E*width, n_embd) with dim=0) and orthogonalizes them as a batch."""
+    x = g if layout is None else _per_expert(g, layout)
+    if g.is_cuda:
+        # the last product writes the scaled result straight into g's layout
+        u = torch.empty(g.shape, dtype=torch.bfloat16, device=g.device)
+        newton_schulz(x, steps, out=u if layout is None else _per_expert(u, layout), scale=_aspect(x))
+        return u
+    u = zeropower_via_newtonschulz5(x, steps) * _aspect(x)
     if layout is None:
-        return zeropower_via_newtonschulz5(g, steps) * max(1.0, g.size(-2) / g.size(-1)) ** 0.5
-    dim, width = layout
-    x = g.reshape(g.size(0), -1, width).transpose(0, 1) if dim == 1 else g.reshape(-1, width, g.size(1))
-    u = zeropower_via_newtonschulz5(x, steps) * max(1.0, x.size(-2) / x.size(-1)) ** 0.5
-    return u.transpose(0, 1).reshape(g.shape) if dim == 1 else u.reshape(g.shape)
+        return u
+    return u.transpose(0, 1).reshape(g.shape) if layout[0] == 1 else u.reshape(g.shape)
+
+
+def orthogonalize_add_(p: Tensor, g: Tensor, steps: int, alpha: float, layout=None,
+                       stochastic: bool = False) -> None:
+    """p += alpha * orthogonalize(g, steps, layout). On CUDA the last Newton-Schulz product adds
+    into p through its per-expert view, accumulating in fp32 and rounding once (no update
+    tensor, no copy-back, scale or update passes); stochastic rounding takes the unfused path."""
+    if not (p.is_cuda and p.is_contiguous() and not stochastic and p.dtype in (torch.bfloat16, torch.float32)):
+        apply_update_(p, orthogonalize(g, steps, layout), alpha, stochastic)
+        return
+    x = g if layout is None else _per_expert(g, layout)
+    out = p if layout is None else _per_expert(p, layout)
+    newton_schulz(x, steps, out=out, scale=alpha * _aspect(x), accumulate=True)
 
 
 class Muon(torch.optim.Optimizer):
@@ -135,7 +162,7 @@ class Muon(torch.optim.Optimizer):
             if layout is None:
                 batches.setdefault(tuple(u.shape), []).append((p, u))
             else:
-                apply_update_(p, orthogonalize(u, steps, layout), alpha, self.stochastic_rounding)
+                orthogonalize_add_(p, u, steps, alpha, layout, self.stochastic_rounding)
         for batch in batches.values():
             stacked = orthogonalize(torch.stack([u for _, u in batch]), steps)
             for (p, _), u in zip(batch, stacked.unbind(0)):
@@ -305,8 +332,8 @@ class FSDPMuon(torch.optim.Optimizer):
                 continue
             for p in group["params"]:
                 g = self._nesterov_(p, group)
-                u = orthogonalize(g, group["ns_steps"], self.expert_layouts[p])
-                apply_update_(_local(p), u, -group["lr"], self.stochastic_rounding)
+                orthogonalize_add_(_local(p), g, group["ns_steps"], -group["lr"],
+                                   self.expert_layouts[p], self.stochastic_rounding)
         # 1. momentum + Nesterov on local shards, then all_to_all the shards to each owner
         pending = []
         for group in self.param_groups:
