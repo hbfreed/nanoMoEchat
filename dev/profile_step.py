@@ -39,6 +39,9 @@ parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--fp32-master-weights", action="store_true")
 parser.add_argument("--use-bias-balancing", action="store_true")
 parser.add_argument("--no-compile", action="store_true")
+parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"])
+parser.add_argument("--activation-checkpointing", action="store_true")
+parser.add_argument("--muon-per-expert", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--loss-impl", type=str, default="chunked", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"])
 parser.add_argument("--warmup", type=int, default=8, help="untimed steps (compile, autotune)")
 parser.add_argument("--steps", type=int, default=10, help="timed steps")
@@ -106,12 +109,21 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 optimizers = model.setup_optimizers(
-    unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0
+    unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
+    muon_per_expert=args.muon_per_expert,
 )
+model.set_moe_backend(args.moe_backend)
+model.set_defer_bias_updates(True)  # as base_train: SMEBU once per step, outside forward
+if args.activation_checkpointing:
+    model.set_activation_checkpointing(True)
 flops_per_token = model.estimate_flops()
 n_params = sum(p.numel() for p in model.parameters())
 if not args.no_compile:
-    model = torch.compile(model, dynamic=False)
+    if args.activation_checkpointing:  # as base_train
+        for block in model.transformer.h:
+            block.compile_pieces()
+    else:
+        model = torch.compile(model, dynamic=False)
 
 B, T = args.device_batch_size, args.max_seq_len
 x = torch.randint(0, args.vocab_size, (B, T), device=device)
