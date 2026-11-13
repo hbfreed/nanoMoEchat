@@ -103,17 +103,43 @@ class Muon(torch.optim.Optimizer):
     def step(self):
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            for p in params:
-                g = p.grad
-                assert g is not None
+            grads = [p.grad for p in params]
+            assert all(g is not None for g in grads)
+            bufs = []
+            for p, g in zip(params, grads):
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
-                buf: Tensor = state["momentum_buffer"]
-                buf.lerp_(g.to(buf.dtype), 1 - group["momentum"])
-                g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
-                g = orthogonalize(g, group["ns_steps"], self.expert_layouts.get(p))
-                apply_update_(p, g, -group["lr"], self.stochastic_rounding)
+                bufs.append(state["momentum_buffer"])
+            momentum = group["momentum"]
+            # one multi-tensor launch per op instead of a kernel per parameter, same lerp math
+            if all(b.dtype == g.dtype for b, g in zip(bufs, grads)):
+                torch._foreach_lerp_(bufs, grads, 1 - momentum)
+                if group["nesterov"]:
+                    torch._foreach_lerp_(grads, bufs, momentum)
+                updates = grads if group["nesterov"] else bufs
+            else:
+                updates = []
+                for g, buf in zip(grads, bufs):
+                    buf.lerp_(g.to(buf.dtype), 1 - momentum)
+                    updates.append(g.lerp_(buf.to(g.dtype), momentum) if group["nesterov"] else buf)
+            self._orthogonalize_and_apply(params, updates, group["ns_steps"], -group["lr"])
+
+    def _orthogonalize_and_apply(self, params, updates, steps, alpha):
+        """p += alpha * orthogonalize(update) for each parameter. Plain matrices of one shape go
+        through Newton-Schulz as one batch (each gets exactly the result it would get alone).
+        Each update is applied as soon as it exists, so at most one batch of them is alive."""
+        batches = {}
+        for p, u in zip(params, updates):
+            layout = self.expert_layouts.get(p)
+            if layout is None:
+                batches.setdefault(tuple(u.shape), []).append((p, u))
+            else:
+                apply_update_(p, orthogonalize(u, steps, layout), alpha, self.stochastic_rounding)
+        for batch in batches.values():
+            stacked = orthogonalize(torch.stack([u for _, u in batch]), steps)
+            for (p, _), u in zip(batch, stacked.unbind(0)):
+                apply_update_(p, u, alpha, self.stochastic_rounding)
 
 
 class DistMuon(torch.optim.Optimizer):

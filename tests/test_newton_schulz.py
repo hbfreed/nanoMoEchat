@@ -54,3 +54,36 @@ def test_strided_and_symmetric_are_exact():
     A = ns.ns_gemm(X, X.mT)
     assert torch.equal(ns.ns_gemm(A, A, A, alpha=2.0, beta=-4.0, symmetric=True),
                        ns.ns_gemm(A, A, A, alpha=2.0, beta=-4.0))
+
+
+@pytest.mark.parametrize("state_dtype", [None, torch.float32])
+def test_muon_step_matches_per_parameter_loop(state_dtype):
+    """Muon.step batches same-shape matrices through Newton-Schulz and runs momentum and the
+    update as multi-tensor ops; it must match the original per-parameter loop bitwise."""
+    from nanochat.muon import Muon, orthogonalize
+    from nanochat.precision import apply_update_
+
+    torch.manual_seed(0)
+    shapes = [(256, 256)] * 5 + [(64, 256), (64, 256), (256, 64), (256, 4 * 128), (4 * 128, 256)]
+    def build():
+        torch.manual_seed(0)
+        return [torch.nn.Parameter(torch.randn(s, device="cuda").bfloat16()) for s in shapes]
+    new, ref = build(), build()
+    layouts = lambda ps: {ps[8]: (1, 128), ps[9]: (0, 128)}  # w1-like and w2-like experts
+    opt = Muon(new, lr=0.02, state_dtype=state_dtype, expert_layouts=layouts(new))
+    ref_layouts, bufs = layouts(ref), {}
+    for step in range(3):
+        gen = torch.Generator("cuda").manual_seed(step)
+        for a, b in zip(new, ref):
+            a.grad = torch.randn(a.shape, device="cuda", generator=gen).bfloat16()
+            b.grad = a.grad.clone()
+        opt.step()
+        with torch.no_grad():
+            for p in ref:  # the previous Muon.step, one parameter at a time
+                g = p.grad
+                buf = bufs.setdefault(p, torch.zeros_like(g, dtype=state_dtype or g.dtype))
+                buf.lerp_(g.to(buf.dtype), 1 - 0.95)
+                g = g.lerp_(buf.to(g.dtype), 0.95)
+                apply_update_(p, orthogonalize(g, 5, ref_layouts.get(p)), -0.02, False)
+    for a, b in zip(new, ref):
+        assert torch.equal(a, b)
