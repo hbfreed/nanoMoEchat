@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 CORPUS_DIR = "/home/henry/Documents/PythonProjects/Cooking-Corpus/data"
-TRANSCRIPTS_DIR = "/home/henry/Documents/cooking-issues-transcripts/labeled"
+TRANSCRIPTS_DIR = "/home/henry/Documents/old-desktop/Documents/cooking-issues-transcripts/labeled"
 DATA_DIR = "/media/henry/MoreFiles/base_data_climbmix"
 
 # Single-author books spanning distinct styles, held out entirely so a
@@ -82,11 +82,11 @@ def load_books():
     return books
 
 
-def load_transcripts():
+def load_transcripts(transcripts_dir=TRANSCRIPTS_DIR):
     docs = []
-    for f in sorted(os.listdir(TRANSCRIPTS_DIR)):
+    for f in sorted(os.listdir(transcripts_dir)):
         if f.endswith(".txt"):
-            with open(os.path.join(TRANSCRIPTS_DIR, f), encoding="utf-8") as fh:
+            with open(os.path.join(transcripts_dir, f), encoding="utf-8") as fh:
                 docs.append(fh.read().strip())
     return docs
 
@@ -153,13 +153,15 @@ def main():
     ap.add_argument("--dolci-frac", type=float, default=0.10,
                     help="dolci tokens as a fraction of each mix shard")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--transcripts-dir", default=TRANSCRIPTS_DIR,
+                    help="labeled Cooking Issues transcripts")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     assert args.repeats <= args.span, "one mix shard per gap: keep repeats <= span"
 
     books = load_books()
     held = {b: books.pop(b) for b in HOLDOUT_BOOKS if b in books}
-    transcripts = load_transcripts()
+    transcripts = load_transcripts(args.transcripts_dir)
     corpus = list(books.values()) + transcripts
     corpus_tokens, ratio = measure_tokens(corpus)
     print(f"books: {len(books)} in-mix + {len(held)} held out ({list(held)})")
