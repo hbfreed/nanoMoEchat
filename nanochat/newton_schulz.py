@@ -142,13 +142,19 @@ def inv_frobenius(X, eps=1e-7, BR=32, BC=128):
     P = triton.cdiv(M, BR)
     part = torch.empty((nb, P), dtype=torch.float32, device=X.device)
     _sumsq_partial[(P, nb)](X, part, M, N, X.stride(0), X.stride(1), X.stride(2), P=P, BR=BR, BC=BC)
-    s = torch.empty(nb, dtype=torch.float32, device=X.device)
+    return inv_norm_from_partials(part, eps)
+
+
+def inv_norm_from_partials(part, eps=1e-7):
+    """(s, s^2) with s = 1/(sqrt(sum of part[i]) + eps) for each row i of (nb, P) partial sums."""
+    nb, P = part.shape
+    s = torch.empty(nb, dtype=torch.float32, device=part.device)
     s2 = torch.empty_like(s)
     _inv_norm[(nb,)](part, s, s2, eps, P=P, PP=triton.next_power_of_2(P))
     return s, s2
 
 
-def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False):
+def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False, inv_norm=None):
     """Muon's quintic Newton-Schulz on a matrix or a batch of matrices, in bf16.
 
     The same iteration and coefficients as the torch version in muon.py. Rounding once per
@@ -161,7 +167,8 @@ def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False):
     per matrix, A = s^2 X X^T and X1 = s (B X + a X), so X/|X| is never materialized. The
     last product writes scale * result into out (any strided view of G's shape, e.g. a
     parameter's per-expert view), or adds it to out with accumulate=True, rounding once
-    from fp32; this saves the copy-back, scale and update passes. Against the fp64 iteration on
+    from fp32; this saves the copy-back, scale and update passes. inv_norm=(s, s^2) passes
+    norms computed elsewhere (Muon's momentum pass computes them for expert matrices). Against the fp64 iteration on
     64 decaying-spectrum 512x512 inputs (singular values exp(-i/50)) this is 4.0% off, the
     unfolded kernel 5.1%, and one bf16 rounding of the input moves the fp64 iteration 4.1%;
     on Gaussian inputs 1.02% vs 1.04%."""
@@ -176,7 +183,7 @@ def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False):
         result = out
         out = out.unsqueeze(0) if squeeze else out
     X = X.bfloat16()
-    s, s2 = inv_frobenius(X)
+    s, s2 = inv_frobenius(X) if inv_norm is None else inv_norm
     if X.size(-2) > X.size(-1):  # iterate on the wide orientation
         X, out = X.mT, out.mT
     for i in range(steps):

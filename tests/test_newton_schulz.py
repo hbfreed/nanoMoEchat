@@ -62,8 +62,9 @@ def test_strided_and_symmetric_are_exact():
 
 @pytest.mark.parametrize("state_dtype", [None, torch.float32])
 def test_muon_step_matches_per_parameter_loop(state_dtype):
-    """Muon.step batches same-shape matrices through Newton-Schulz and runs momentum and the
-    update as multi-tensor ops; it must match a per-parameter loop bitwise."""
+    """Muon.step batches same-shape matrices through Newton-Schulz and runs momentum and Nesterov
+    in one pass; it must match a per-parameter loop bitwise (expert matrices to one bf16 step:
+    their norms come from the momentum pass)."""
     from nanochat.muon import Muon, orthogonalize, orthogonalize_add_
     from nanochat.precision import apply_update_
 
@@ -92,8 +93,13 @@ def test_muon_step_matches_per_parameter_loop(state_dtype):
                     orthogonalize_add_(p, g, 5, -0.02, ref_layouts[p])
                 else:
                     apply_update_(p, orthogonalize(g, 5), -0.02, False)
-    for a, b in zip(new, ref):
-        assert torch.equal(a, b)
+    for i, (a, b) in enumerate(zip(new, ref)):
+        if i < 8:
+            assert torch.equal(a, b)
+        else:  # Muon's momentum pass computes the expert norms, summing in another order
+            d = (a.float() - b.float()).abs() - _ulp(b)
+            # bf16 steps of p, or a small fraction of the 3 updates of about 1e-3 each
+            assert (d <= 1e-4).all()
 
 
 def _ulp(x):
@@ -161,3 +167,27 @@ def test_nesterov_matches_lerps(buf_dtype, g_dtype, momentum):
     buf_ref.lerp_(g_ref.to(buf_dtype), 1 - momentum)
     g_ref.lerp_(buf_ref.to(g_dtype), momentum)
     assert torch.equal(buf, buf_ref) and torch.equal(g, g_ref)
+
+
+@pytest.mark.parametrize("shape,layout", [((256, 4 * 512), (1, 512)), ((4 * 512, 256), (0, 512)),
+                                          ((100, 3 * 256), (1, 256)), ((3 * 64, 300), (0, 64)),
+                                          ((256, 3 * 128), (1, 128))])
+def test_nesterov_expert_norms(shape, layout):
+    """nesterov_ with an expert layout also returns each expert's 1/|g_e| (of the new g, in bf16),
+    matching inv_frobenius on the per-expert view up to fp32 summation order; widths that do
+    not fit its tiles return None."""
+    from nanochat.muon import _per_expert, nesterov_
+    from nanochat.newton_schulz import inv_frobenius
+    torch.manual_seed(0)
+    g = torch.randn(shape, device="cuda").bfloat16()
+    buf = torch.randn(shape, device="cuda").bfloat16()
+    g_ref, buf_ref = g.clone(), buf.clone()
+    norms = nesterov_(g, buf, 0.95, layout)
+    nesterov_(g_ref, buf_ref, 0.95)
+    assert torch.equal(g, g_ref) and torch.equal(buf, buf_ref)
+    if layout == (1, 128):  # narrower than the 256-column tiles
+        assert norms is None
+        return
+    s, s2 = inv_frobenius(_per_expert(g, layout))
+    torch.testing.assert_close(norms[0], s, rtol=1e-6, atol=0)
+    torch.testing.assert_close(norms[1], s2, rtol=2e-6, atol=0)

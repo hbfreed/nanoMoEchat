@@ -9,7 +9,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from nanochat.newton_schulz import newton_schulz
+from nanochat.newton_schulz import inv_norm_from_partials, newton_schulz
 from nanochat.precision import apply_update_
 
 @triton.jit
@@ -22,17 +22,34 @@ def _lerp(start, end, w, one_minus_w, SMALL: tl.constexpr):
 
 
 @triton.jit
-def _nesterov_kernel(g, buf, n, w1, omw1, w2, omw2, SMALL1: tl.constexpr, SMALL2: tl.constexpr,
-                     BLOCK: tl.constexpr):
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    graw = tl.load(g + offs, mask=mask)
-    gv = graw.to(tl.float32)
-    bv = tl.load(buf + offs, mask=mask).to(tl.float32)
+def _nesterov_kernel(g, buf, part, R, C, w1, omw1, w2, omw2, SMALL1: tl.constexpr, SMALL2: tl.constexpr,
+                     NORM: tl.constexpr, DIM: tl.constexpr, WIDTH: tl.constexpr, P: tl.constexpr,
+                     NCB: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+    """Momentum and Nesterov on a BR x BC tile of the (R, C) matrices g and buf. With NORM, also
+    each tile's sum of squares of the new g (as bf16, which Newton-Schulz reads) into
+    part[expert, k], where experts are WIDTH-wide slices along DIM (see orthogonalize)."""
+    i = tl.program_id(0)
+    j = tl.program_id(1)
+    rows = i * BR + tl.arange(0, BR)
+    cols = j * BC + tl.arange(0, BC)
+    mask = (rows[:, None] < R) & (cols[None, :] < C)
+    offs = rows[:, None].to(tl.int64) * C + cols[None, :]
+    graw = tl.load(g + offs, mask=mask, other=0.0)
+    bv = tl.load(buf + offs, mask=mask, other=0.0).to(tl.float32)
     bv = _lerp(bv, graw.to(buf.dtype.element_ty).to(tl.float32), w1, omw1, SMALL1).to(buf.dtype.element_ty)
     tl.store(buf + offs, bv, mask=mask)
     end = bv.to(g.dtype.element_ty).to(tl.float32)
-    tl.store(g + offs, _lerp(gv, end, w2, omw2, SMALL2).to(g.dtype.element_ty), mask=mask)
+    gn = _lerp(graw.to(tl.float32), end, w2, omw2, SMALL2).to(g.dtype.element_ty)
+    tl.store(g + offs, gn, mask=mask)
+    if NORM:
+        x = gn.to(tl.bfloat16).to(tl.float32)
+        if DIM == 1:  # expert e owns columns [e * WIDTH, (e + 1) * WIDTH)
+            e = (j * BC) // WIDTH
+            k = i * (WIDTH // BC) + j % (WIDTH // BC)
+        else:  # expert e owns rows [e * WIDTH, (e + 1) * WIDTH)
+            e = (i * BR) // WIDTH
+            k = (i % (WIDTH // BR)) * NCB + j
+        tl.store(part + e * P + k, tl.sum(x * x))
 
 
 def _lerp_args(w):
@@ -41,22 +58,35 @@ def _lerp_args(w):
 
 
 def _fusable(g: Tensor, buf: Tensor) -> bool:
-    return g.is_cuda and g.is_contiguous() and buf.is_contiguous() and g.shape == buf.shape
+    return g.is_cuda and g.ndim == 2 and g.is_contiguous() and buf.is_contiguous() and g.shape == buf.shape
 
 
-def nesterov_(g: Tensor, buf: Tensor, momentum: float) -> None:
+def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256):
     """buf.lerp_(g, 1 - momentum); g.lerp_(buf, momentum), in one pass over g and buf (two
     _foreach_lerp_ read and write both twice: 17.4 -> 11.5 ms on 36 bf16 512x65536 grads, RTX
-    3090). Bitwise equal to the two lerps, also when buf
-    and g differ in dtype (each is rounded to the other's dtype where the lerps convert it)."""
-    assert g.is_contiguous() and buf.is_contiguous() and g.shape == buf.shape
+    3090). Bitwise equal to the two lerps, also when buf and g differ in dtype (each is rounded
+    to the other's dtype where the lerps convert it).
+
+    With a per-expert layout (see orthogonalize) whose width is a multiple of the tile, it also
+    returns 1/(|g_e| + eps) and its square per expert, from the same pass: the norm Newton-Schulz
+    starts with, without reading g again (14.4 -> 11.8 ms for momentum and norms of those 36).
+    Otherwise it returns None."""
     w1, omw1, small1 = _lerp_args(1 - momentum)
     w2, omw2, small2 = _lerp_args(momentum)
-    n, BLOCK = g.numel(), 2048
-    if n == 0:
-        return
-    _nesterov_kernel[(triton.cdiv(n, BLOCK),)](g, buf, n, w1, omw1, w2, omw2, SMALL1=small1,
-                                               SMALL2=small2, BLOCK=BLOCK, num_warps=8)
+    R, C = g.shape
+    if g.numel() == 0:
+        return None
+    nrb, ncb = triton.cdiv(R, BR), triton.cdiv(C, BC)
+    dim, width = layout if layout is not None else (0, 0)
+    norm = layout is not None and (width % BC == 0 if dim == 1 else width % BR == 0)
+    E, P = 1, 1
+    if norm:
+        E, P = (C // width, nrb * (width // BC)) if dim == 1 else (R // width, (width // BR) * ncb)
+    part = torch.empty((E, P), dtype=torch.float32, device=g.device) if norm else g
+    _nesterov_kernel[(nrb, ncb)](g, buf, part, R, C, w1, omw1, w2, omw2, SMALL1=small1, SMALL2=small2,
+                                 NORM=norm, DIM=dim, WIDTH=width, P=P, NCB=ncb, BR=BR, BC=BC,
+                                 num_warps=8)
+    return inv_norm_from_partials(part) if norm else None
 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
@@ -125,16 +155,17 @@ def orthogonalize(g: Tensor, steps: int, layout=None) -> Tensor:
 
 
 def orthogonalize_add_(p: Tensor, g: Tensor, steps: int, alpha: float, layout=None,
-                       stochastic: bool = False) -> None:
+                       stochastic: bool = False, inv_norm=None) -> None:
     """p += alpha * orthogonalize(g, steps, layout). On CUDA the last Newton-Schulz product adds
     into p through its per-expert view, accumulating in fp32 and rounding once (no update
-    tensor, no copy-back, scale or update passes); stochastic rounding takes the unfused path."""
+    tensor, no copy-back, scale or update passes); stochastic rounding takes the unfused path.
+    inv_norm: per-matrix (s, s^2) from nesterov_, if it computed them."""
     if not (p.is_cuda and p.is_contiguous() and not stochastic and p.dtype in (torch.bfloat16, torch.float32)):
         apply_update_(p, orthogonalize(g, steps, layout), alpha, stochastic)
         return
     x = g if layout is None else _per_expert(g, layout)
     out = p if layout is None else _per_expert(p, layout)
-    newton_schulz(x, steps, out=out, scale=alpha * _aspect(x), accumulate=True)
+    newton_schulz(x, steps, out=out, scale=alpha * _aspect(x), accumulate=True, inv_norm=inv_norm)
 
 
 class Muon(torch.optim.Optimizer):
@@ -189,9 +220,10 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
                 bufs.append(state["momentum_buffer"])
             momentum = group["momentum"]
+            inv_norms = {}
             if group["nesterov"] and all(_fusable(g, b) for g, b in zip(grads, bufs)):
-                for g, buf in zip(grads, bufs):
-                    nesterov_(g, buf, momentum)
+                for p, g, buf in zip(params, grads, bufs):
+                    inv_norms[p] = nesterov_(g, buf, momentum, self.expert_layouts.get(p))
                 updates = grads
             # one multi-tensor launch per op instead of a kernel per parameter, same lerp math
             elif all(b.dtype == g.dtype for b, g in zip(bufs, grads)):
@@ -204,9 +236,9 @@ class Muon(torch.optim.Optimizer):
                 for g, buf in zip(grads, bufs):
                     buf.lerp_(g.to(buf.dtype), 1 - momentum)
                     updates.append(g.lerp_(buf.to(g.dtype), momentum) if group["nesterov"] else buf)
-            self._orthogonalize_and_apply(params, updates, group["ns_steps"], -group["lr"])
+            self._orthogonalize_and_apply(params, updates, group["ns_steps"], -group["lr"], inv_norms)
 
-    def _orthogonalize_and_apply(self, params, updates, steps, alpha):
+    def _orthogonalize_and_apply(self, params, updates, steps, alpha, inv_norms):
         """p += alpha * orthogonalize(update) for each parameter. Plain matrices of one shape go
         through Newton-Schulz as one batch (each gets exactly the result it would get alone).
         Each update is applied as soon as it exists, so at most one batch of them is alive."""
@@ -216,7 +248,7 @@ class Muon(torch.optim.Optimizer):
             if layout is None:
                 batches.setdefault(tuple(u.shape), []).append((p, u))
             else:
-                orthogonalize_add_(p, u, steps, alpha, layout, self.stochastic_rounding)
+                orthogonalize_add_(p, u, steps, alpha, layout, self.stochastic_rounding, inv_norms.get(p))
         for batch in batches.values():
             stacked = orthogonalize(torch.stack([u for _, u in batch]), steps)
             for (p, _), u in zip(batch, stacked.unbind(0)):
