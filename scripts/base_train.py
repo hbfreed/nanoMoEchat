@@ -121,6 +121,7 @@ parser.add_argument("--profile-step", type=int, default=-1, help="profile this s
 parser.add_argument("--muon-per-expert", action=argparse.BooleanOptionalAction, default=True, help="Muon orthogonalizes each MoE expert's matrices separately rather than the concatenated (n_embd, E*width) matrices (with --fsdp, experts are sharded whole, so no optimizer communication). A/B, depth-4 192x256 top-4, 2000 steps: val bpb 1.1300 vs 1.1398 joint")
 parser.add_argument("--activation-checkpointing", action="store_true", help="recompute each block in backward to fit bigger micro-batches")
 parser.add_argument("--checkpoint-layers", type=int, default=-1, help="with --activation-checkpointing: checkpoint only the first N blocks (-1: all), trading memory for less recompute")
+parser.add_argument("--fuse-grad-accum", action=argparse.BooleanOptionalAction, default=True, help="single GPU: the swiglu experts' weight-gradient kernels accumulate into .grad themselves instead of autograd adding each micro-batch's fresh dW (GPT.set_fuse_grad_accum). d=512, 12 layers, 128x512 experts top 8, 4 micro-batches of 8192 tokens on a 3090: 645 -> 627 ms/step. Off with --fsdp or more than one rank")
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
 parser.add_argument("--fsdp-keep-weights", action="store_true", help="with --fsdp: keep each block's gathered weights from forward to backward instead of gathering them again (reshard_after_forward=False). Costs about 4/3 bytes per parameter per rank. 3.74B total on 3x3090: 2788 -> 2335 ms/step")
 parser.add_argument("--fsdp-copy-engine", action=argparse.BooleanOptionalAction, default=True, help="with --fsdp: all-gather through the GPUs' copy engines (symmetric memory, NCCL_CTA_POLICY=2), so communication stops taking SMs from compute. 3.74B total on 3x3090 with --fsdp-keep-weights: 2350 -> 2120 ms/step")
@@ -239,6 +240,11 @@ model.set_defer_bias_updates(True)
 if args.activation_checkpointing:
     model.set_activation_checkpointing(True, None if args.checkpoint_layers < 0 else args.checkpoint_layers)
 model.set_moe_backend(args.moe_backend)
+# FSDP2 shards the weights and reduce-scatters every backward's gradients, so it is a
+# different problem; DDP reads .grad only after the micro-steps and should work, but
+# has not been tested with it.
+if args.fuse_grad_accum and not ddp:
+    model.set_fuse_grad_accum(True)
 if args.fsdp:
     # FSDP2: each block (and the root: embeddings, lm_head, final norm) is all-gathered
     # for its forward/backward and resharded after (after backward only, with
