@@ -73,12 +73,21 @@ def is_expert(name):
     return name.rsplit(".", 1)[-1] in EXPERT
 
 
+def nondeterministic(name):
+    # The compiled embedding backward accumulates rows with atomic adds, so its bits can
+    # change between identical runs, fused or not.
+    return name == "transformer.wte.weight"
+
+
 def compare(grads0, grads1, first_only=False):
     assert grads0.keys() == grads1.keys()
     for name, g0 in grads0.items():
         g1 = grads1[name]
         assert g1.dtype == g0.dtype and g1.shape == g0.shape, name
-        if not is_expert(name) or first_only:
+        if nondeterministic(name):
+            rel = ((g1.float() - g0.float()).norm() / g0.float().norm()).item()
+            assert rel < 1e-3, (name, rel)
+        elif not is_expert(name) or first_only:
             assert torch.equal(g1, g0), name
         else:
             rel = ((g1.float() - g0.float()).norm() / g0.float().norm()).item()
@@ -122,7 +131,7 @@ def test_optimizer_step_matches():
         params.append({n: p.detach().float().clone() for n, p in model.named_parameters()})
     p0, p1 = params
     for name in p0:
-        if is_expert(name):
+        if is_expert(name) or nondeterministic(name):
             rel = ((p1[name] - p0[name]).norm() / p0[name].norm()).item()
             assert rel < 1e-2, (name, rel)
         else:

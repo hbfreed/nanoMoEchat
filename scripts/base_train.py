@@ -127,6 +127,7 @@ parser.add_argument("--fsdp-keep-weights", action="store_true", help="with --fsd
 parser.add_argument("--fsdp-copy-engine", action=argparse.BooleanOptionalAction, default=True, help="with --fsdp: all-gather through the GPUs' copy engines (symmetric memory, NCCL_CTA_POLICY=2), so communication stops taking SMs from compute. 3.74B total on 3x3090 with --fsdp-keep-weights: 2350 -> 2120 ms/step")
 parser.add_argument("--token-rounding", type=str, default="ceil", choices=["ceil", "nearest"], help="swiglu experts while training: ceil pads each expert's routes to whole 128-row tiles; nearest rounds to the nearest tile, dropping the lowest-scoring routes of experts that round down (evaluation keeps every route)")
 parser.add_argument("--ns-schedule", type=str, default="quintic", choices=["quintic", "cubic5"], help="Muon's Newton-Schulz: quintic (Keller Jordan's, 3 products per step) or cubic5 (arXiv 2606.00371, 2 per step)")
+parser.add_argument("--muon-int8-momentum", action="store_true", help="store Muon's momentum as int8 with an fp32 scale per 256 values (half of bf16; arXiv 2509.23106); single GPU only")
 parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"], help="megablocks backend for swiglu experts: triton (any GPU) or cute (CuTe DSL, Ampere; 1.5-3%% faster end to end on 3x3090)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
@@ -336,6 +337,7 @@ optimizers = model.setup_optimizers(
     fsdp=args.fsdp,
     muon_per_expert=args.muon_per_expert,
     ns_schedule=args.ns_schedule,
+    muon_int8_momentum=args.muon_int8_momentum,
 )
 adamw_optimizer, muon_optimizer = optimizers
 

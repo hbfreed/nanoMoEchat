@@ -237,3 +237,47 @@ def test_cubic5_muon_step_runs_all_paths():
         opt.step()
         for p, b in zip(ps, before):
             assert torch.isfinite(p).all() and not torch.equal(p, b)
+
+
+@pytest.mark.parametrize("shape", [(64, 1024), (37, 300), (8, 256)])
+def test_int8_momentum_kernel_matches_torch(shape):
+    """The fused int8-momentum kernel matches the torch version: quantized buffer and scales
+    exactly (up to an occasional one-step rounding tie), Nesterov output to bf16 rounding."""
+    from nanochat.muon import _nesterov_int8_torch, int8_momentum, nesterov_
+    torch.manual_seed(0)
+    g0 = torch.randn(shape, device="cuda").bfloat16()
+    buf_k, sc_k = int8_momentum(g0)
+    buf_t, sc_t = int8_momentum(g0)
+    for step in range(4):
+        g = (g0 * (1 + step)).clone()
+        gk, gt = g.clone(), g.clone()
+        nesterov_(gk, buf_k, 0.95, scale=sc_k)
+        _nesterov_int8_torch(gt, buf_t, sc_t, 0.95)
+        assert torch.allclose(sc_k, sc_t, rtol=1e-6)
+        assert (buf_k.int() - buf_t.int()).abs().max() <= 1
+        assert _rel(gk, gt) < 1e-2
+
+
+def test_int8_momentum_tracks_bf16_momentum():
+    """Muon with int8 momentum stays about as close to fp32 momentum as bf16 momentum does, over
+    10 steps on weights at the models' init scale (std 0.02, so the updates are not below
+    the weights' own bf16 rounding)."""
+    from nanochat.muon import Muon
+    def run(state_dtype):
+        torch.manual_seed(0)
+        ps = [torch.nn.Parameter((0.02 * torch.randn(s, device="cuda")).bfloat16())
+              for s in [(256, 4 * 128), (4 * 128, 256), (256, 256)]]
+        opt = Muon(ps, lr=0.02, state_dtype=state_dtype, expert_layouts={ps[0]: (1, 128), ps[1]: (0, 128)})
+        start = [p.detach().float().clone() for p in ps]
+        for step in range(10):
+            gen = torch.Generator("cuda").manual_seed(step)
+            for p in ps:
+                p.grad = torch.randn(p.shape, device="cuda", generator=gen).bfloat16()
+            opt.step()
+        return [p.detach().float() - s for p, s in zip(ps, start)], opt
+    ref, _ = run(torch.float32)
+    bf16, _ = run(None)
+    got, opt = run(torch.int8)
+    assert all(st["momentum_buffer"].dtype == torch.int8 for st in opt.state.values())
+    for a, b, r in zip(got, bf16, ref):
+        assert _rel(a, r) < max(2 * _rel(b, r), 2e-2), (_rel(a, r), _rel(b, r))

@@ -41,6 +41,7 @@ parser.add_argument("--use-bias-balancing", action="store_true")
 parser.add_argument("--no-compile", action="store_true")
 parser.add_argument("--token-rounding", type=str, default="ceil", choices=["ceil", "nearest"])
 parser.add_argument("--ns-schedule", type=str, default="quintic", choices=["quintic", "cubic5"])
+parser.add_argument("--muon-int8-momentum", action="store_true")
 parser.add_argument("--compile-mode", type=str, default=None, help="torch.compile mode, e.g. max-autotune-no-cudagraphs")
 parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"])
 parser.add_argument("--activation-checkpointing", action="store_true")
@@ -117,6 +118,7 @@ optimizers = model.setup_optimizers(
     unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
     muon_per_expert=args.muon_per_expert,
     ns_schedule=args.ns_schedule,
+    muon_int8_momentum=args.muon_int8_momentum,
 )
 model.set_moe_backend(args.moe_backend)
 model.set_token_rounding(args.token_rounding)

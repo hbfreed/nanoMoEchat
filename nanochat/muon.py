@@ -22,12 +22,15 @@ def _lerp(start, end, w, one_minus_w, SMALL: tl.constexpr):
 
 
 @triton.jit
-def _nesterov_kernel(g, buf, part, R, C, w1, omw1, w2, omw2, SMALL1: tl.constexpr, SMALL2: tl.constexpr,
-                     NORM: tl.constexpr, DIM: tl.constexpr, WIDTH: tl.constexpr, P: tl.constexpr,
-                     NCB: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr):
+def _nesterov_kernel(g, buf, scale, part, R, C, w1, omw1, w2, omw2, SMALL1: tl.constexpr,
+                     SMALL2: tl.constexpr, QUANT: tl.constexpr, NORM: tl.constexpr, DIM: tl.constexpr,
+                     WIDTH: tl.constexpr, P: tl.constexpr, NCB: tl.constexpr, BR: tl.constexpr,
+                     BC: tl.constexpr):
     """Momentum and Nesterov on a BR x BC tile of the (R, C) matrices g and buf. With NORM, also
     each tile's sum of squares of the new g (as bf16, which Newton-Schulz reads) into
-    part[expert, k], where experts are WIDTH-wide slices along DIM (see orthogonalize)."""
+    part[expert, k], where experts are WIDTH-wide slices along DIM (see orthogonalize).
+    With QUANT, buf is int8 with one fp32 scale per row per BC columns (scale[row, j]): it is
+    dequantized, updated in fp32, used unrounded for Nesterov, and requantized linearly."""
     i = tl.program_id(0)
     j = tl.program_id(1)
     rows = i * BR + tl.arange(0, BR)
@@ -35,10 +38,22 @@ def _nesterov_kernel(g, buf, part, R, C, w1, omw1, w2, omw2, SMALL1: tl.constexp
     mask = (rows[:, None] < R) & (cols[None, :] < C)
     offs = rows[:, None].to(tl.int64) * C + cols[None, :]
     graw = tl.load(g + offs, mask=mask, other=0.0)
-    bv = tl.load(buf + offs, mask=mask, other=0.0).to(tl.float32)
-    bv = _lerp(bv, graw.to(buf.dtype.element_ty).to(tl.float32), w1, omw1, SMALL1).to(buf.dtype.element_ty)
-    tl.store(buf + offs, bv, mask=mask)
-    end = bv.to(g.dtype.element_ty).to(tl.float32)
+    if QUANT:
+        sc = tl.load(scale + rows * NCB + j, mask=rows < R, other=0.0)
+        bv = tl.load(buf + offs, mask=mask, other=0).to(tl.float32) * sc[:, None]
+        bv = _lerp(bv, graw.to(tl.float32), w1, omw1, SMALL1)
+        amax = tl.max(tl.abs(bv), axis=1)
+        sc = tl.where(amax > 0, amax / 127.0, 1.0)
+        q = tl.floor(bv / sc[:, None] + 0.5)
+        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+        tl.store(buf + offs, q.to(tl.int8), mask=mask)
+        tl.store(scale + rows * NCB + j, sc, mask=rows < R)
+        end = bv
+    else:
+        bv = tl.load(buf + offs, mask=mask, other=0.0).to(tl.float32)
+        bv = _lerp(bv, graw.to(buf.dtype.element_ty).to(tl.float32), w1, omw1, SMALL1).to(buf.dtype.element_ty)
+        tl.store(buf + offs, bv, mask=mask)
+        end = bv.to(g.dtype.element_ty).to(tl.float32)
     gn = _lerp(graw.to(tl.float32), end, w2, omw2, SMALL2).to(g.dtype.element_ty)
     tl.store(g + offs, gn, mask=mask)
     if NORM:
@@ -61,7 +76,32 @@ def _fusable(g: Tensor, buf: Tensor) -> bool:
     return g.is_cuda and g.ndim == 2 and g.is_contiguous() and buf.is_contiguous() and g.shape == buf.shape
 
 
-def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256):
+QUANT_BLOCK = 256  # momentum values per int8 scale, along a row
+
+
+def int8_momentum(g: Tensor):
+    """Zeroed int8 momentum for g, with its (rows, cdiv(cols, QUANT_BLOCK)) fp32 scales."""
+    R, C = g.shape
+    return (torch.zeros((R, C), dtype=torch.int8, device=g.device),
+            torch.zeros((R, triton.cdiv(C, QUANT_BLOCK)), dtype=torch.float32, device=g.device))
+
+
+def _nesterov_int8_torch(g: Tensor, buf: Tensor, scale: Tensor, momentum: float) -> None:
+    """nesterov_ with int8 momentum, in torch (CPU or strided tensors); same math as the kernel."""
+    R, C = g.shape
+    pad = scale.size(1) * QUANT_BLOCK - C
+    blocks = lambda t: torch.nn.functional.pad(t, (0, pad)).view(R, -1, QUANT_BLOCK)
+    bv = blocks(buf.float()) * scale[..., None]
+    bv = bv.lerp(blocks(g.float()), 1 - momentum)
+    amax = bv.abs().amax(-1)
+    sc = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    q = torch.floor(bv / sc[..., None] + 0.5).clamp(-127, 127)
+    buf.copy_(q.view(R, -1)[:, :C].to(torch.int8))
+    scale.copy_(sc)
+    g.copy_(g.float().lerp(bv.view(R, -1)[:, :C], momentum).to(g.dtype))
+
+
+def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256, scale=None):
     """buf.lerp_(g, 1 - momentum); g.lerp_(buf, momentum), in one pass over g and buf (two
     _foreach_lerp_ read and write both twice: 17.4 -> 11.5 ms on 36 bf16 512x65536 grads, RTX
     3090). Bitwise equal to the two lerps, also when buf and g differ in dtype (each is rounded
@@ -70,7 +110,14 @@ def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256
     With a per-expert layout (see orthogonalize) whose width is a multiple of the tile, it also
     returns 1/(|g_e| + eps) and its square per expert, from the same pass: the norm Newton-Schulz
     starts with, without reading g again (14.4 -> 11.8 ms for momentum and norms of those 36).
-    Otherwise it returns None."""
+    Otherwise it returns None.
+
+    An int8 buf (int8_momentum) is linearly quantized with one fp32 scale per row per 256
+    columns, passed as scale: half the memory of bf16 momentum, as in Gupta et al., "Effective
+    Quantization of Muon Optimizer States" (arXiv 2509.23106), whose linear 8-bit Muon matched
+    full precision within 1-2% of validation loss up to 2.7B parameters."""
+    quant = buf.dtype == torch.int8
+    assert not quant or (scale is not None and BC == QUANT_BLOCK)
     w1, omw1, small1 = _lerp_args(1 - momentum)
     w2, omw2, small2 = _lerp_args(momentum)
     R, C = g.shape
@@ -83,9 +130,9 @@ def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256
     if norm:
         E, P = (C // width, nrb * (width // BC)) if dim == 1 else (R // width, (width // BR) * ncb)
     part = torch.empty((E, P), dtype=torch.float32, device=g.device) if norm else g
-    _nesterov_kernel[(nrb, ncb)](g, buf, part, R, C, w1, omw1, w2, omw2, SMALL1=small1, SMALL2=small2,
-                                 NORM=norm, DIM=dim, WIDTH=width, P=P, NCB=ncb, BR=BR, BC=BC,
-                                 num_warps=8)
+    _nesterov_kernel[(nrb, ncb)](g, buf, scale if quant else g, part, R, C, w1, omw1, w2, omw2,
+                                 SMALL1=small1, SMALL2=small2, QUANT=quant, NORM=norm, DIM=dim,
+                                 WIDTH=width, P=P, NCB=ncb, BR=BR, BC=BC, num_warps=8)
     return inv_norm_from_partials(part) if norm else None
 
 
@@ -195,7 +242,8 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
         stochastic_rounding: stochastically round bf16 weight updates.
-        state_dtype: dtype for the momentum buffer (default: the grad's dtype).
+        state_dtype: dtype for the momentum buffer (default: the grad's dtype); torch.int8
+            stores it linearly quantized (see nesterov_), which needs nesterov=True.
         expert_layouts: {param: (dim, width)} for MoE expert matrices to orthogonalize
             per expert (see orthogonalize); other params are orthogonalized whole.
     """
@@ -223,11 +271,23 @@ class Muon(torch.optim.Optimizer):
             for p, g in zip(params, grads):
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
+                    if self.state_dtype == torch.int8:
+                        state["momentum_buffer"], state["momentum_scale"] = int8_momentum(g)
+                    else:
+                        state["momentum_buffer"] = torch.zeros_like(g, dtype=self.state_dtype or g.dtype)
                 bufs.append(state["momentum_buffer"])
             momentum = group["momentum"]
             inv_norms = {}
-            if group["nesterov"] and all(_fusable(g, b) for g, b in zip(grads, bufs)):
+            if self.state_dtype == torch.int8:
+                assert group["nesterov"], "int8 momentum is implemented for Nesterov momentum"
+                for p, g, buf in zip(params, grads, bufs):
+                    if _fusable(g, buf):
+                        inv_norms[p] = nesterov_(g, buf, momentum, self.expert_layouts.get(p),
+                                                 scale=self.state[p]["momentum_scale"])
+                    else:
+                        _nesterov_int8_torch(g, buf, self.state[p]["momentum_scale"], momentum)
+                updates = grads
+            elif group["nesterov"] and all(_fusable(g, b) for g, b in zip(grads, bufs)):
                 for p, g, buf in zip(params, grads, bufs):
                     inv_norms[p] = nesterov_(g, buf, momentum, self.expert_layouts.get(p))
                 updates = grads

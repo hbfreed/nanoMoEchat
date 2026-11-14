@@ -1140,7 +1140,7 @@ class GPT(nn.Module):
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
         stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004, fsdp=False,
-        muon_per_expert=False, ns_schedule="quintic",
+        muon_per_expert=False, ns_schedule="quintic", muon_int8_momentum=False,
     ):
         """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
         fsdp: params are FSDP2-sharded (fully_shard); AdamW steps each rank's shards and
@@ -1194,6 +1194,9 @@ class GPT(nn.Module):
             adamw_optimizer = torch.optim.AdamW(adam_groups, **adamw_kwargs, fused=True)
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95, ns_schedule=ns_schedule, **precision_kwargs)
+        if muon_int8_momentum:  # linearly quantized Muon momentum, see muon.nesterov_
+            assert not (fsdp or use_sharded), "int8 Muon momentum is single-GPU Muon only so far"
+            muon_kwargs["state_dtype"] = torch.int8
         if muon_per_expert:
             muon_kwargs["expert_layouts"] = self.expert_layouts()
         MuonFactory = FSDPMuon if fsdp else DistMuon if use_sharded else Muon
