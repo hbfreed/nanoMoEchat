@@ -1140,7 +1140,7 @@ class GPT(nn.Module):
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
         stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004, fsdp=False,
-        muon_per_expert=False, ns_schedule="quintic", muon_int8_momentum=False,
+        muon_per_expert=False, ns_schedule="quintic", muon_int8_momentum=False, expert_lr_mult=1.0,
     ):
         """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
         fsdp: params are FSDP2-sharded (fully_shard); AdamW steps each rank's shards and
@@ -1201,6 +1201,18 @@ class GPT(nn.Module):
             muon_kwargs["expert_layouts"] = self.expert_layouts()
         MuonFactory = FSDPMuon if fsdp else DistMuon if use_sharded else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        if expert_lr_mult != 1.0:
+            # Each expert sees about top_k / num_experts of the routes, but Muon gives its
+            # matrices full-size updates, so their LR is worth tuning apart from the dense ones.
+            assert not fsdp, "--expert-lr-mult is not wired into FSDPMuon's groups yet"
+            expert_ids = {id(getattr(block.mlp, name)) for block in self.transformer.h
+                          if isinstance(block.mlp, MoEMLP) for name in ("w1", "w2", "w3")
+                          if hasattr(block.mlp, name)}
+            for group in muon_optimizer.param_groups:
+                is_expert = [id(p) in expert_ids for p in group["params"]]
+                if any(is_expert):
+                    assert all(is_expert), "expert and dense matrices share a Muon group"
+                    group["lr"] *= expert_lr_mult
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:

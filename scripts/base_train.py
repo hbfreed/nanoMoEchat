@@ -102,6 +102,7 @@ parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning ra
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.0, help="weight decay for embedding/unembedding (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--expert-lr-mult", type=float, default=1.0, help="multiplier on --matrix-lr for MoE expert matrices (w1/w2/w3); not with --fsdp")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.2, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -338,6 +339,7 @@ optimizers = model.setup_optimizers(
     muon_per_expert=args.muon_per_expert,
     ns_schedule=args.ns_schedule,
     muon_int8_momentum=args.muon_int8_momentum,
+    expert_lr_mult=args.expert_lr_mult,
 )
 adamw_optimizer, muon_optimizer = optimizers
 

@@ -281,3 +281,21 @@ def test_int8_momentum_tracks_bf16_momentum():
     assert all(st["momentum_buffer"].dtype == torch.int8 for st in opt.state.values())
     for a, b, r in zip(got, bf16, ref):
         assert _rel(a, r) < max(2 * _rel(b, r), 2e-2), (_rel(a, r), _rel(b, r))
+
+
+def test_expert_lr_mult_scales_only_expert_groups():
+    from nanochat.gpt import GPT, GPTConfig
+    cfg = GPTConfig(sequence_len=128, vocab_size=512, n_layer=2, n_head=2, n_kv_head=2, n_embd=256,
+                    window_pattern="L", expert_sizes=[(8, 256)], num_active_experts=2, mlp_act="swiglu")
+    with torch.device("meta"):
+        model = GPT(cfg)
+    model.to_empty(device="cuda")
+    model.init_weights()
+    _, muon = model.setup_optimizers(matrix_lr=0.02, muon_per_expert=True, expert_lr_mult=0.5)
+    experts = {id(getattr(b.mlp, n)) for b in model.transformer.h for n in ("w1", "w2", "w3")}
+    seen = set()
+    for group in muon.param_groups:
+        kind = id(group["params"][0]) in experts
+        seen.add(kind)
+        assert group["initial_lr"] == pytest.approx(0.01 if kind else 0.02)
+    assert seen == {True, False}
