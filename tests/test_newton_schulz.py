@@ -145,3 +145,19 @@ def test_fused_update_stochastic_rounding_falls_back():
         step += (q.float() - 1.0) / 16
     coef = (step * u).sum() / (u * u).sum()  # least-squares fit of step = coef * u
     assert abs(coef.item() + 1e-3) < 1e-4
+
+
+@pytest.mark.parametrize("buf_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("g_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("momentum", [0.95, 0.3])
+def test_nesterov_matches_lerps(buf_dtype, g_dtype, momentum):
+    """The one-pass momentum + Nesterov kernel is bitwise equal to Muon's two lerps."""
+    from nanochat.muon import nesterov_
+    torch.manual_seed(0)
+    g = torch.randn(300, 1031, device="cuda").to(g_dtype)
+    buf = torch.randn(300, 1031, device="cuda").to(buf_dtype)
+    g_ref, buf_ref = g.clone(), buf.clone()
+    nesterov_(g, buf, momentum)
+    buf_ref.lerp_(g_ref.to(buf_dtype), 1 - momentum)
+    g_ref.lerp_(buf_ref.to(g_dtype), momentum)
+    assert torch.equal(buf, buf_ref) and torch.equal(g, g_ref)
