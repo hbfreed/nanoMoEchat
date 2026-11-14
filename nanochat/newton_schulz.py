@@ -17,6 +17,13 @@ import triton.language as tl
 
 A_COEF, B_COEF, C_COEF = (3.4445, -4.7750, 2.0315)
 
+# "cubic5" (Huang, "How Much Orthogonalization Does Muon Need?", arXiv 2606.00371, Table 1):
+# five cubic steps X <- a_t X + b_t (X X^T) X, 2 products each instead of the quintic's 3. The
+# paper's hybrid MoE/Mamba runs (1-4B, 88-215B tokens) matched quintic Muon within 1e-3
+# validation loss.
+CUBIC5 = ((3.3656576, -3.3420992), (2.5744352, -1.4957376), (2.5368962, -1.4312570),
+          (2.4418906, -1.2764040), (2.2230472, -0.9630650))
+
 
 @triton.jit
 def _ns_gemm(
@@ -154,7 +161,8 @@ def inv_norm_from_partials(part, eps=1e-7):
     return s, s2
 
 
-def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False, inv_norm=None):
+def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False, inv_norm=None,
+                  schedule="quintic"):
     """Muon's quintic Newton-Schulz on a matrix or a batch of matrices, in bf16.
 
     The same iteration and coefficients as the torch version in muon.py. Rounding once per
@@ -171,8 +179,13 @@ def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False, inv_norm
     norms computed elsewhere (Muon's momentum pass computes them for expert matrices). Against the fp64 iteration on
     64 decaying-spectrum 512x512 inputs (singular values exp(-i/50)) this is 4.0% off, the
     unfolded kernel 5.1%, and one bf16 rounding of the input moves the fp64 iteration 4.1%;
-    on Gaussian inputs 1.02% vs 1.04%."""
+    on Gaussian inputs 1.02% vs 1.04%.
+
+    schedule="cubic5" runs CUBIC5's steps instead, with the same normalization folding and
+    last-product write."""
     assert steps >= 1
+    assert schedule in ("quintic", "cubic5"), schedule
+    assert schedule == "quintic" or steps <= len(CUBIC5)
     squeeze = G.ndim == 2
     X = G.unsqueeze(0) if squeeze else G
     if out is None:
@@ -189,6 +202,14 @@ def newton_schulz(G, steps: int, out=None, scale=1.0, accumulate=False, inv_norm
     for i in range(steps):
         first, last = i == 0, i == steps - 1
         A = ns_gemm(X, X.mT, symmetric=True, f=s2 if first else None)   # X X^T
+        if schedule == "cubic5":
+            a, b = CUBIC5[i]
+            if last:  # scale * (b A X + a X), written or added into out
+                ns_gemm(A, X, X, alpha=b if first else b * scale, beta=a if first else a * scale,
+                        out=out, f=s * scale if first else None, accumulate=accumulate)
+            else:
+                X = ns_gemm(A, X, X, alpha=b, beta=a, f=s if first else None)  # b A X + a X
+            continue
         B = ns_gemm(A, A, A, alpha=C_COEF, beta=B_COEF, symmetric=True)  # c A A + b A
         if last:  # scale * (B X + a X), written or added into out
             f = s * scale if first else None

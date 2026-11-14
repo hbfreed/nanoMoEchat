@@ -191,3 +191,49 @@ def test_nesterov_expert_norms(shape, layout):
     s, s2 = inv_frobenius(_per_expert(g, layout))
     torch.testing.assert_close(norms[0], s, rtol=1e-6, atol=0)
     torch.testing.assert_close(norms[1], s2, rtol=2e-6, atol=0)
+
+
+def _torch_cubic5(G, steps=5):
+    """cubic5 with the kernel's rounding: each product rounded once from fp32, the
+    normalization folded into the first step."""
+    from nanochat.newton_schulz import CUBIC5
+    X = G.bfloat16()
+    tall = X.size(-2) > X.size(-1)
+    X = X.mT if tall else X
+    s = 1 / (X.float().norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for i, (a, b) in enumerate(CUBIC5[:steps]):
+        f = s if i == 0 else 1.0
+        A = (f * f * (X.float() @ X.float().mT)).bfloat16()
+        X = (f * (b * (A.float() @ X.float()) + a * X.float())).bfloat16()
+    return X.mT if tall else X
+
+
+@pytest.mark.parametrize("shape", [(512, 512), (128, 512), (512, 128), (100, 64), (16, 512, 512)])
+def test_cubic5_matches_torch_iteration(shape):
+    from nanochat.newton_schulz import newton_schulz
+    torch.manual_seed(0)
+    G = torch.randn(shape, device="cuda").bfloat16()
+    out = newton_schulz(G, 5, schedule="cubic5")
+    assert _rel(out, _torch_cubic5(G)) < 1e-2
+    # added into a buffer through the fused last product, as Muon applies it; the buffer is
+    # small so its own bf16 rounding (one step is 2^-8 of its magnitude) stays below the update
+    base = (1e-3 * torch.randn(shape, device="cuda")).bfloat16()
+    acc = base.clone()
+    newton_schulz(G, 5, out=acc, scale=-0.5, accumulate=True, schedule="cubic5")
+    assert _rel(acc.float() - base.float(), -0.5 * _torch_cubic5(G).float()) < 2e-2
+
+
+def test_cubic5_muon_step_runs_all_paths():
+    """Muon with ns_schedule="cubic5" on expert layouts, a batched plain matrix and the CPU path."""
+    from nanochat.muon import Muon
+    for device in ("cuda", "cpu"):
+        torch.manual_seed(0)
+        ps = [torch.nn.Parameter(torch.randn(s, device=device).bfloat16())
+              for s in [(256, 4 * 128), (4 * 128, 256), (256, 256), (256, 256)]]
+        opt = Muon(ps, lr=0.02, ns_schedule="cubic5", expert_layouts={ps[0]: (1, 128), ps[1]: (0, 128)})
+        before = [p.detach().clone() for p in ps]
+        for p in ps:
+            p.grad = torch.randn_like(p)
+        opt.step()
+        for p, b in zip(ps, before):
+            assert torch.isfinite(p).all() and not torch.equal(p, b)

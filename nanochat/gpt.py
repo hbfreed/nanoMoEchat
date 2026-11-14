@@ -305,6 +305,11 @@ class MoEMLP(nn.Module):
         # "cute" (CuTe DSL, Ampere, needs megablocks[cute]). Speed only, so it is a
         # runtime setting (GPT.set_moe_backend), not part of the config or checkpoint.
         self.moe_backend = "triton"
+        # Token rounding for the swiglu experts while training (GPT.set_token_rounding):
+        # "ceil" pads each expert's routes to whole 128-row tiles; "nearest" rounds them to the
+        # nearest tile, dropping each rounded-down expert's lowest-scoring routes. Evaluation
+        # always keeps every route.
+        self.token_rounding = "ceil"
         # megablocks' weight_grad_key for w1/w3/w2 (GPT.set_fuse_grad_accum), or None.
         # When set, the swiglu path's weight-gradient kernels add each micro-batch's
         # expert gradients into .grad themselves (writing it when it is None) instead
@@ -529,6 +534,7 @@ class MoEMLP(nn.Module):
             top_k_weights, selected_experts = torch.topk(
                 router_probs, self.num_active_experts, dim=-1
             )
+        route_scores = top_k_weights  # router probabilities: what nearest rounding ranks by
         top_k_weights = top_k_weights / (
             top_k_weights.sum(dim=-1, keepdim=True) + 1e-20
         )  # epsilon so we don't divide by 0
@@ -567,6 +573,8 @@ class MoEMLP(nn.Module):
                 != torch.is_inference_mode_enabled()
             ):
                 self._build_grouped_plan(x_flat.device)
+            rounding = self.token_rounding if self.training else "ceil"
+            route_stats = None
             x_permuted = grouped_moe(
                 x_flat,
                 top_k_weights_flat,
@@ -578,7 +586,12 @@ class MoEMLP(nn.Module):
                 self.w2.to(x_flat.dtype),
                 down_proj_backend=self.moe_backend,
                 weight_grad_key=self.weight_grad_key,
+                token_rounding=rounding,
+                route_scores=route_scores.flatten() if rounding == "nearest" else None,
+                return_route_stats=rounding == "nearest",
             )
+            if rounding == "nearest":
+                x_permuted, route_stats = x_permuted
         else:
             # Compute bins for gather/scatter
             bins = ops.inclusive_cumsum(tokens_per_expert, 0).contiguous()
@@ -653,6 +666,8 @@ class MoEMLP(nn.Module):
             "compute_loss": compute_loss,
             "router_logits_abs_max": router_logits.abs().max().detach(),
             "router_logits_abs_mean": router_logits.abs().mean().detach(),
+            **({"dropped_route_fraction": route_stats["dropped_route_fraction"]}
+               if self.mlp_act == "swiglu" and route_stats is not None else {}),
         }
         if self.use_bias_balancing:
             aux_loss["expert_bias_abs_max"] = self.expert_bias.abs().max()
@@ -1072,6 +1087,13 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             block.activation_checkpointing = enabled and i < n
 
+    def set_token_rounding(self, rounding):
+        """Token rounding for the swiglu experts while training: "ceil" or "nearest" (see MoEMLP)."""
+        assert rounding in ("ceil", "nearest"), rounding
+        for block in self.transformer.h:
+            if isinstance(block.mlp, MoEMLP):
+                block.mlp.token_rounding = rounding
+
     def set_moe_backend(self, backend):
         """megablocks backend for the swiglu experts: "triton" or "cute" (see MoEMLP)."""
         assert backend in ("triton", "cute"), backend
@@ -1118,7 +1140,7 @@ class GPT(nn.Module):
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
         stochastic_rounding=False, optim_state_dtype=None, norm_lr=0.004, fsdp=False,
-        muon_per_expert=False,
+        muon_per_expert=False, ns_schedule="quintic",
     ):
         """norm_lr: AdamW LR for 1-D params (afmoe norm weights); untuned.
         fsdp: params are FSDP2-sharded (fully_shard); AdamW steps each rank's shards and
@@ -1171,7 +1193,7 @@ class GPT(nn.Module):
         else:
             adamw_optimizer = torch.optim.AdamW(adam_groups, **adamw_kwargs, fused=True)
         # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, **precision_kwargs)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95, ns_schedule=ns_schedule, **precision_kwargs)
         if muon_per_expert:
             muon_kwargs["expert_layouts"] = self.expert_layouts()
         MuonFactory = FSDPMuon if fsdp else DistMuon if use_sharded else Muon

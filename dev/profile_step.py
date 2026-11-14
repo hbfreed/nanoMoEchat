@@ -39,6 +39,9 @@ parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--fp32-master-weights", action="store_true")
 parser.add_argument("--use-bias-balancing", action="store_true")
 parser.add_argument("--no-compile", action="store_true")
+parser.add_argument("--token-rounding", type=str, default="ceil", choices=["ceil", "nearest"])
+parser.add_argument("--ns-schedule", type=str, default="quintic", choices=["quintic", "cubic5"])
+parser.add_argument("--compile-mode", type=str, default=None, help="torch.compile mode, e.g. max-autotune-no-cudagraphs")
 parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"])
 parser.add_argument("--activation-checkpointing", action="store_true")
 parser.add_argument("--fuse-grad-accum", action=argparse.BooleanOptionalAction, default=True, help="as base_train (GPT.set_fuse_grad_accum)")
@@ -113,8 +116,10 @@ model.init_weights()
 optimizers = model.setup_optimizers(
     unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0,
     muon_per_expert=args.muon_per_expert,
+    ns_schedule=args.ns_schedule,
 )
 model.set_moe_backend(args.moe_backend)
+model.set_token_rounding(args.token_rounding)
 model.set_defer_bias_updates(True)  # as base_train: SMEBU once per step, outside forward
 if args.activation_checkpointing:
     model.set_activation_checkpointing(True)
@@ -123,7 +128,7 @@ if args.fuse_grad_accum:
 flops_per_token = model.estimate_flops()
 n_params = sum(p.numel() for p in model.parameters())
 if not args.no_compile:
-    model = torch.compile(model, dynamic=False)
+    model = torch.compile(model, dynamic=False, mode=args.compile_mode)
 
 B, T = args.device_batch_size, args.max_seq_len
 x = torch.randint(0, args.vocab_size, (B, T), device=device)

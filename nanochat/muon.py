@@ -9,7 +9,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from nanochat.newton_schulz import inv_norm_from_partials, newton_schulz
+from nanochat.newton_schulz import CUBIC5, inv_norm_from_partials, newton_schulz
 from nanochat.precision import apply_update_
 
 @triton.jit
@@ -89,17 +89,17 @@ def nesterov_(g: Tensor, buf: Tensor, momentum: float, layout=None, BR=8, BC=256
     return inv_norm_from_partials(part) if norm else None
 
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+def zeropower_via_newtonschulz5(G: Tensor, steps: int, schedule: str = "quintic") -> Tensor:
     """Newton-Schulz orthogonalization of G (or a batch of matrices). On CUDA the Triton
     kernels in newton_schulz.py run it (474 -> 266 ms per per-expert Muon step at d=512 with
     128x512 experts); elsewhere the torch version below."""
     if G.is_cuda:
-        return newton_schulz(G, steps)
-    return _zeropower_torch(G, steps)
+        return newton_schulz(G, steps, schedule=schedule)
+    return _zeropower_torch(G, steps, schedule)
 
 
 @torch.compile
-def _zeropower_torch(G: Tensor, steps: int) -> Tensor:
+def _zeropower_torch(G: Tensor, steps: int, schedule: str = "quintic") -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -118,8 +118,11 @@ def _zeropower_torch(G: Tensor, steps: int) -> Tensor:
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
-    for _ in range(steps):
+    for i in range(steps):
         A = X @ X.mT
+        if schedule == "cubic5":  # see newton_schulz.CUBIC5
+            X = CUBIC5[i][0] * X + CUBIC5[i][1] * A @ X
+            continue
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
 
@@ -137,7 +140,7 @@ def _aspect(x: Tensor) -> float:
     return max(1.0, x.size(-2) / x.size(-1)) ** 0.5
 
 
-def orthogonalize(g: Tensor, steps: int, layout=None) -> Tensor:
+def orthogonalize(g: Tensor, steps: int, layout=None, schedule: str = "quintic") -> Tensor:
     """Muon's update direction for g: Newton-Schulz orthogonalized, times the aspect-ratio
     scale sqrt(max(1, rows/cols)). layout=(dim, width) treats each width-sized slice of g
     along dim as its own matrix (one per MoE expert: w1/w3 are (n_embd, E*width) with
@@ -146,26 +149,28 @@ def orthogonalize(g: Tensor, steps: int, layout=None) -> Tensor:
     if g.is_cuda:
         # the last product writes the scaled result straight into g's layout
         u = torch.empty(g.shape, dtype=torch.bfloat16, device=g.device)
-        newton_schulz(x, steps, out=u if layout is None else _per_expert(u, layout), scale=_aspect(x))
+        newton_schulz(x, steps, out=u if layout is None else _per_expert(u, layout), scale=_aspect(x),
+                      schedule=schedule)
         return u
-    u = zeropower_via_newtonschulz5(x, steps) * _aspect(x)
+    u = zeropower_via_newtonschulz5(x, steps, schedule) * _aspect(x)
     if layout is None:
         return u
     return u.transpose(0, 1).reshape(g.shape) if layout[0] == 1 else u.reshape(g.shape)
 
 
 def orthogonalize_add_(p: Tensor, g: Tensor, steps: int, alpha: float, layout=None,
-                       stochastic: bool = False, inv_norm=None) -> None:
+                       stochastic: bool = False, inv_norm=None, schedule: str = "quintic") -> None:
     """p += alpha * orthogonalize(g, steps, layout). On CUDA the last Newton-Schulz product adds
     into p through its per-expert view, accumulating in fp32 and rounding once (no update
     tensor, no copy-back, scale or update passes); stochastic rounding takes the unfused path.
     inv_norm: per-matrix (s, s^2) from nesterov_, if it computed them."""
     if not (p.is_cuda and p.is_contiguous() and not stochastic and p.dtype in (torch.bfloat16, torch.float32)):
-        apply_update_(p, orthogonalize(g, steps, layout), alpha, stochastic)
+        apply_update_(p, orthogonalize(g, steps, layout, schedule), alpha, stochastic)
         return
     x = g if layout is None else _per_expert(g, layout)
     out = p if layout is None else _per_expert(p, layout)
-    newton_schulz(x, steps, out=out, scale=alpha * _aspect(x), accumulate=True, inv_norm=inv_norm)
+    newton_schulz(x, steps, out=out, scale=alpha * _aspect(x), accumulate=True, inv_norm=inv_norm,
+                  schedule=schedule)
 
 
 class Muon(torch.optim.Optimizer):
@@ -195,8 +200,9 @@ class Muon(torch.optim.Optimizer):
             per expert (see orthogonalize); other params are orthogonalized whole.
     """
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
-                 stochastic_rounding=False, state_dtype=None, expert_layouts=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+                 stochastic_rounding=False, state_dtype=None, expert_layouts=None, ns_schedule="quintic"):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        ns_schedule=ns_schedule)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
         self.expert_layouts = expert_layouts or {}
@@ -236,9 +242,10 @@ class Muon(torch.optim.Optimizer):
                 for g, buf in zip(grads, bufs):
                     buf.lerp_(g.to(buf.dtype), 1 - momentum)
                     updates.append(g.lerp_(buf.to(g.dtype), momentum) if group["nesterov"] else buf)
-            self._orthogonalize_and_apply(params, updates, group["ns_steps"], -group["lr"], inv_norms)
+            self._orthogonalize_and_apply(params, updates, group["ns_steps"], -group["lr"], inv_norms,
+                                          group["ns_schedule"])
 
-    def _orthogonalize_and_apply(self, params, updates, steps, alpha, inv_norms):
+    def _orthogonalize_and_apply(self, params, updates, steps, alpha, inv_norms, schedule):
         """p += alpha * orthogonalize(update) for each parameter. Plain matrices of one shape go
         through Newton-Schulz as one batch (each gets exactly the result it would get alone).
         Each update is applied as soon as it exists, so at most one batch of them is alive."""
@@ -248,9 +255,10 @@ class Muon(torch.optim.Optimizer):
             if layout is None:
                 batches.setdefault(tuple(u.shape), []).append((p, u))
             else:
-                orthogonalize_add_(p, u, steps, alpha, layout, self.stochastic_rounding, inv_norms.get(p))
+                orthogonalize_add_(p, u, steps, alpha, layout, self.stochastic_rounding, inv_norms.get(p),
+                                   schedule)
         for batch in batches.values():
-            stacked = orthogonalize(torch.stack([u for _, u in batch]), steps)
+            stacked = orthogonalize(torch.stack([u for _, u in batch]), steps, schedule=schedule)
             for (p, _), u in zip(batch, stacked.unbind(0)):
                 apply_update_(p, u, alpha, self.stochastic_rounding)
 
@@ -278,8 +286,10 @@ class DistMuon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5,
-                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None,
+                 ns_schedule: str = "quintic"):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        ns_schedule=ns_schedule)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
         self.expert_layouts = expert_layouts or {}
@@ -352,7 +362,7 @@ class DistMuon(torch.optim.Optimizer):
                     else:
                         buf.lerp_(g.to(buf.dtype), 1.0 - group["momentum"])
                         g = g.lerp_(buf.to(g.dtype), group["momentum"]) if group["nesterov"] else buf
-                    g = orthogonalize(g, group["ns_steps"], self.expert_layouts.get(p))
+                    g = orthogonalize(g, group["ns_steps"], self.expert_layouts.get(p), group["ns_schedule"])
                     apply_update_(p, g, -group["lr"], self.stochastic_rounding)
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
@@ -384,8 +394,10 @@ class FSDPMuon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
                  nesterov: bool = True, ns_steps: int = 5,
-                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+                 stochastic_rounding: bool = False, state_dtype=None, expert_layouts=None,
+                 ns_schedule: str = "quintic"):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
+                        ns_schedule=ns_schedule)
         self.stochastic_rounding = stochastic_rounding
         self.state_dtype = state_dtype
         self.expert_layouts = expert_layouts or {}
@@ -422,7 +434,8 @@ class FSDPMuon(torch.optim.Optimizer):
             for p in group["params"]:
                 g = self._nesterov_(p, group)
                 orthogonalize_add_(_local(p), g, group["ns_steps"], -group["lr"],
-                                   self.expert_layouts[p], self.stochastic_rounding)
+                                   self.expert_layouts[p], self.stochastic_rounding,
+                                   schedule=group["ns_schedule"])
         # 1. momentum + Nesterov on local shards, then all_to_all the shards to each owner
         pending = []
         for group in self.param_groups:
@@ -449,7 +462,8 @@ class FSDPMuon(torch.optim.Optimizer):
             dtype, device, cols = recv[0].dtype, recv[0].device, recv[0].size(1)
             if rank < len(chunk):
                 full = torch.cat(recv)
-                u = orthogonalize(full, group["ns_steps"], self.expert_layouts.get(chunk[rank]))
+                u = orthogonalize(full, group["ns_steps"], self.expert_layouts.get(chunk[rank]),
+                                  group["ns_schedule"])
                 send = [s.contiguous() for s in u.split(rows)]
             else:
                 send = [torch.empty(0, cols, dtype=dtype, device=device) for _ in rows]

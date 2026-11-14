@@ -125,6 +125,8 @@ parser.add_argument("--fuse-grad-accum", action=argparse.BooleanOptionalAction, 
 parser.add_argument("--fsdp", action="store_true", help="FSDP2: shard params, grads and optimizer state across ranks (per block)")
 parser.add_argument("--fsdp-keep-weights", action="store_true", help="with --fsdp: keep each block's gathered weights from forward to backward instead of gathering them again (reshard_after_forward=False). Costs about 4/3 bytes per parameter per rank. 3.74B total on 3x3090: 2788 -> 2335 ms/step")
 parser.add_argument("--fsdp-copy-engine", action=argparse.BooleanOptionalAction, default=True, help="with --fsdp: all-gather through the GPUs' copy engines (symmetric memory, NCCL_CTA_POLICY=2), so communication stops taking SMs from compute. 3.74B total on 3x3090 with --fsdp-keep-weights: 2350 -> 2120 ms/step")
+parser.add_argument("--token-rounding", type=str, default="ceil", choices=["ceil", "nearest"], help="swiglu experts while training: ceil pads each expert's routes to whole 128-row tiles; nearest rounds to the nearest tile, dropping the lowest-scoring routes of experts that round down (evaluation keeps every route)")
+parser.add_argument("--ns-schedule", type=str, default="quintic", choices=["quintic", "cubic5"], help="Muon's Newton-Schulz: quintic (Keller Jordan's, 3 products per step) or cubic5 (arXiv 2606.00371, 2 per step)")
 parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"], help="megablocks backend for swiglu experts: triton (any GPU) or cute (CuTe DSL, Ampere; 1.5-3%% faster end to end on 3x3090)")
 parser.add_argument("--pretokenized", action="store_true", help="read <base_dir>/tokens/<tokenizer> (scripts/pretokenize.py) instead of tokenizing parquet on the fly")
 args = parser.parse_args()
@@ -240,6 +242,7 @@ model.set_defer_bias_updates(True)
 if args.activation_checkpointing:
     model.set_activation_checkpointing(True, None if args.checkpoint_layers < 0 else args.checkpoint_layers)
 model.set_moe_backend(args.moe_backend)
+model.set_token_rounding(args.token_rounding)
 # FSDP2 shards the weights and reduce-scatters every backward's gradients, so it is a
 # different problem; DDP reads .grad only after the micro-steps and should work, but
 # has not been tested with it.
@@ -332,6 +335,7 @@ optimizers = model.setup_optimizers(
     norm_lr=args.norm_lr,
     fsdp=args.fsdp,
     muon_per_expert=args.muon_per_expert,
+    ns_schedule=args.ns_schedule,
 )
 adamw_optimizer, muon_optimizer = optimizers
 
@@ -707,6 +711,8 @@ for step in range(start_step, num_iterations + 1):
         if combined_aux_loss is not None:
             log_dict["train/ce_loss"] = combined_aux_loss["ce_loss"].item()
             log_dict["train/router_z_loss"] = combined_aux_loss["router_z_loss"].item()
+            if "dropped_route_fraction" in combined_aux_loss:
+                log_dict["train/dropped_route_fraction"] = combined_aux_loss["dropped_route_fraction"].item()
             log_dict["train/load_balance_loss"] = combined_aux_loss["load_balance_loss"].item()
             if "compute_loss" in combined_aux_loss:
                 log_dict["train/compute_loss"] = combined_aux_loss["compute_loss"].item()
