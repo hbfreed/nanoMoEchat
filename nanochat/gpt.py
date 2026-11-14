@@ -64,7 +64,7 @@ from einops import rearrange
 from megablocks import ops
 from megablocks.layers.relu_squared import relu_squared
 from megablocks.backend.fused_moe import FusedMoEPlan
-from megablocks.backend.grouped_moe import grouped_moe
+from megablocks.backend.grouped_moe import grouped_moe, register_weight_grads
 
 from nanochat.adamw import AdamW, DistAdamW
 from nanochat.common import COMPUTE_DTYPE, get_dist_info, print0
@@ -305,6 +305,11 @@ class MoEMLP(nn.Module):
         # "cute" (CuTe DSL, Ampere, needs megablocks[cute]). Speed only, so it is a
         # runtime setting (GPT.set_moe_backend), not part of the config or checkpoint.
         self.moe_backend = "triton"
+        # megablocks' weight_grad_key for w1/w3/w2 (GPT.set_fuse_grad_accum), or None.
+        # When set, the swiglu path's weight-gradient kernels add each micro-batch's
+        # expert gradients into .grad themselves (writing it when it is None) instead
+        # of autograd adding a fresh dW in a separate pass. Also a runtime setting.
+        self.weight_grad_key = None
         if self.use_bias_balancing:
             self.register_buffer("expert_bias", torch.zeros(self.num_experts))
             # SMEBU momentum buffer — smooths bias updates over time
@@ -572,6 +577,7 @@ class MoEMLP(nn.Module):
                 self.w3.to(x_flat.dtype),
                 self.w2.to(x_flat.dtype),
                 down_proj_backend=self.moe_backend,
+                weight_grad_key=self.weight_grad_key,
             )
         else:
             # Compute bins for gather/scatter
@@ -1074,6 +1080,23 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
                 block.mlp.moe_backend = backend
+
+    def set_fuse_grad_accum(self, enabled=True):
+        """Accumulate the swiglu experts' weight gradients into w1/w3/w2.grad inside
+        megablocks' weight-gradient kernels (see MoEMLP.weight_grad_key). Call it once
+        the weights are on their device (after to_empty), before torch.compile.
+
+        Not under FSDP: fully_shard replaces the parameters with sharded DTensors that
+        forward swaps for gathered copies, and FSDP2 reduce-scatters each backward's
+        gradients and accumulates the shards itself, so the registered weights would
+        be gone (megablocks raises). With fp32 master weights the op sees bf16 casts,
+        so megablocks falls back to AccumulateGrad's add and nothing is saved."""
+        for block in self.transformer.h:
+            mlp = block.mlp
+            if isinstance(mlp, MoEMLP) and mlp.mlp_act == "swiglu":
+                mlp.weight_grad_key = (
+                    register_weight_grads(mlp.w1, mlp.w3, mlp.w2) if enabled else None
+                )
 
     def bias_balanced_mlps(self):
         return [b.mlp for b in self.transformer.h if getattr(b.mlp, "use_bias_balancing", False)]

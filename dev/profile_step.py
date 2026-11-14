@@ -41,6 +41,8 @@ parser.add_argument("--use-bias-balancing", action="store_true")
 parser.add_argument("--no-compile", action="store_true")
 parser.add_argument("--moe-backend", type=str, default="triton", choices=["triton", "cute"])
 parser.add_argument("--activation-checkpointing", action="store_true")
+parser.add_argument("--fuse-grad-accum", action=argparse.BooleanOptionalAction, default=True, help="as base_train (GPT.set_fuse_grad_accum)")
+parser.add_argument("--grad-accum-steps", type=int, default=1, help="micro-batches per optimizer step; the forward/backward phases sum over them")
 parser.add_argument("--muon-per-expert", action=argparse.BooleanOptionalAction, default=True)
 parser.add_argument("--loss-impl", type=str, default="chunked", choices=["cce_kahan_full_c", "cce", "compiled", "chunked"])
 parser.add_argument("--warmup", type=int, default=8, help="untimed steps (compile, autotune)")
@@ -116,6 +118,8 @@ model.set_moe_backend(args.moe_backend)
 model.set_defer_bias_updates(True)  # as base_train: SMEBU once per step, outside forward
 if args.activation_checkpointing:
     model.set_activation_checkpointing(True)
+if args.fuse_grad_accum:
+    model.set_fuse_grad_accum(True)
 flops_per_token = model.estimate_flops()
 n_params = sum(p.numel() for p in model.parameters())
 if not args.no_compile:
@@ -127,19 +131,22 @@ y = torch.randint(0, args.vocab_size, (B, T), device=device)
 
 
 def step(events=None):
+    """events: 2 * grad_accum_steps + 2 CUDA events, recorded before each forward,
+    before each backward, before the optimizer and at the end."""
+    for i in range(args.grad_accum_steps):
+        if events:
+            events[2 * i].record()
+        _, loss, _ = model(x, y)
+        if events:
+            events[2 * i + 1].record()
+        (loss / args.grad_accum_steps).backward()
     if events:
-        events[0].record()
-    _, loss, _ = model(x, y)
-    if events:
-        events[1].record()
-    loss.backward()
-    if events:
-        events[2].record()
+        events[-2].record()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
     if events:
-        events[3].record()
+        events[-1].record()
 
 
 ceiling = matmul_ceiling()
@@ -151,12 +158,14 @@ torch.cuda.reset_peak_memory_stats()
 phase = defaultdict(float)
 t0 = time.perf_counter()
 for _ in range(args.steps):
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+    n = args.grad_accum_steps
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(2 * n + 2)]
     step(ev)
     torch.cuda.synchronize()
-    phase["forward"] += ev[0].elapsed_time(ev[1])
-    phase["backward"] += ev[1].elapsed_time(ev[2])
-    phase["optimizer"] += ev[2].elapsed_time(ev[3])
+    for i in range(n):
+        phase["forward"] += ev[2 * i].elapsed_time(ev[2 * i + 1])
+        phase["backward"] += ev[2 * i + 1].elapsed_time(ev[2 * i + 2])
+    phase["optimizer"] += ev[-2].elapsed_time(ev[-1])
 step_s = (time.perf_counter() - t0) / args.steps
 peak_mem = torch.cuda.max_memory_allocated() / 1e9
 
@@ -174,7 +183,7 @@ for e in prof.key_averages():
     by_kernel[e.key] += t
 gpu_total = sum(by_cat.values())
 
-tokens = B * T
+tokens = B * T * args.grad_accum_steps
 tflops = flops_per_token * tokens / step_s / 1e12
 from nanochat.flash_attention import ATTN_IMPL
 print(f"attention: {ATTN_IMPL} | window pattern {args.window_pattern} (S window {args.sliding_window})")
