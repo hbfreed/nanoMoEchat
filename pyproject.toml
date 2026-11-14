@@ -12,7 +12,7 @@ dependencies = [
     "files-to-prompt>=0.6",
     "matplotlib>=3.10.8",
     # cute: the CuTe DSL expert backend (base_train --moe-backend=cute, Ampere)
-    "megablocks[cute] @ git+https://github.com/hbfreed/megablocks-variable.git@d8e480b754926e12664210bf34622949ad4deba0",
+    "megablocks[cute] @ git+https://github.com/hbfreed/megablocks-variable.git@23e17237653cb23b03bf75e0614a4d3f7e2865e7",
     "numpy==1.26.4",
     "psutil>=7.1.0",
     "python-dotenv>=1.2.1",
