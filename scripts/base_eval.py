@@ -128,7 +128,10 @@ def main():
     # distributed / precision setup
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    # Autocast only for HF models: nanochat's GPT runs bf16 itself (as in base_train), and autocast
+    # would upcast rms_norm to fp32 and hand fp32 q/k/v to FlashAttention.
+    use_autocast = device_type == "cuda" and args.hf_path is not None
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if use_autocast else nullcontext()
 
     # Load model and tokenizer from command line or from file system
     if args.hf_path is not None:
