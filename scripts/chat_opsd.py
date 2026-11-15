@@ -90,6 +90,14 @@ parser.add_argument("--teacher-url", type=str, default="http://localhost:8011",
                     help="vLLM server for --teacher (OpenAI-compatible /v1/completions)")
 parser.add_argument("--teacher-passage", type=int, default=1,
                     help="give an external teacher the privileged passage (1) or only the question (0)")
+parser.add_argument("--dolci-mix", type=str, default="",
+                    help="add Dolci-Instruct-RL prompts as fractions of all prompts, e.g. "
+                         "'general:0.45,ifeval:0.3,math:0.05' (rest: cooking). Categories: general, ifeval, "
+                         "math, code. Teacher sees them as is (no passage, no verifier). Empty: cooking only")
+parser.add_argument("--num-prompts", type=int, default=0,
+                    help="total prompts with --dolci-mix (0: all cooking prompts at the cooking fraction)")
+parser.add_argument("--max-prompt-tokens", type=int, default=512, help="drop Dolci prompts longer than this")
+parser.add_argument("--seed", type=int, default=0, help="prompt sampling and order (same on every rank)")
 parser.add_argument("--out-tag", type=str, default=None,
                     help="checkpoint dir name under chatrl_checkpoints (default: --model-tag, else d<n_layer>)")
 args = parser.parse_args()
@@ -117,6 +125,10 @@ model.set_defer_bias_updates(True)
 engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
 out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
+# one rollout per example per step (rank 0): question, answer, per-rollout KL
+samples_path = os.path.join(get_base_dir(), "chatrl_checkpoints", out_tag, "samples.jsonl")
+if master_process:
+    os.makedirs(os.path.dirname(samples_path), exist_ok=True)
 
 external = args.teacher is not None
 if external:
@@ -167,7 +179,48 @@ with open(opsd_path, encoding="utf-8") as f:
         )
         if external:  # Qwen has no document separator in chat; add its empty think block
             teacher_prefix = teacher_prefix[1:] + think_header
-        examples.append((student_prefix, teacher_prefix))
+        examples.append((student_prefix, teacher_prefix, row["question"], "cooking"))
+
+if args.dolci_mix:
+    import random
+    import pyarrow.parquet as pq
+    fracs = {k: float(v) for k, v in (kv.split(":") for kv in args.dolci_mix.split(","))}
+    cats = {"general": {"general-quality_ref", "general-quality"}, "ifeval": {"ifeval"},
+            "math": {"math"}, "code": {"code"}}
+    assert set(fracs) <= set(cats), f"unknown Dolci categories {set(fracs) - set(cats)}"
+    cook_frac = 1.0 - sum(fracs.values())
+    assert 0 < cook_frac <= 1, "Dolci fractions must sum to less than 1 (the rest is cooking)"
+    total = args.num_prompts or round(len(examples) / cook_frac)
+    rng = random.Random(args.seed)
+    pool = {k: [] for k in fracs}
+    for i in range(3):
+        path = hf_hub_download("allenai/Dolci-Instruct-RL", f"data/train-0000{i}-of-00003.parquet",
+                               repo_type="dataset")
+        for r in pq.read_table(path, columns=["dataset", "prompt"]).to_pylist():
+            d = r["dataset"][0] if isinstance(r["dataset"], list) else r["dataset"]
+            text = r["prompt"]
+            # single-turn only: the prompt field is "user: ..." with turns inlined
+            if not text.startswith("user: ") or "\nassistant:" in text:
+                continue
+            for k in fracs:
+                if d in cats[k]:
+                    pool[k].append(text[len("user: "):])
+    picked = {"cooking": rng.sample(examples, min(len(examples), round(total * cook_frac)))}
+    for k, frac in fracs.items():
+        rng.shuffle(pool[k])
+        want, chosen = round(total * frac), []
+        for q in pool[k]:
+            if len(chosen) == want:
+                break
+            sp = tokenizer.render_for_completion({"messages": [{"role": "user", "content": q}, dummy]})
+            if len(sp) > args.max_prompt_tokens:
+                continue
+            tp = sp[1:] + think_header if external else sp
+            chosen.append((sp, tp, q, k))
+        picked[k] = chosen
+    examples = [e for v in picked.values() for e in v]
+    rng.shuffle(examples)  # same seed on every rank, so the rank stride splits one shared order
+    print0("prompt mix: " + ", ".join(f"{k} {len(v)}" for k, v in picked.items()))
 print0(f"OPSD examples: {len(examples)}")
 
 assert args.examples_per_step % ddp_world_size == 0
@@ -231,11 +284,13 @@ for opt in optimizers:
 
 # -----------------------------------------------------------------------------
 rank_example_iter = itertools.cycle(range(ddp_rank, len(examples), ddp_world_size))
+mean_kl = float("nan")  # defined even when there are no iterations
 
 for step in range(num_iterations):
     step_kl, step_tokens, step_stops, step_rollouts = 0.0, 0, 0, 0
+    step_samples = []
     for _ in range(examples_per_rank):
-        student_prefix, teacher_prefix = examples[next(rank_example_iter)]
+        student_prefix, teacher_prefix, question, prompt_source = examples[next(rank_example_iter)]
         prefix_len = len(student_prefix)
 
         # ---- rollouts (on-policy, current weights) ----
@@ -302,6 +357,15 @@ for step in range(num_iterations):
                 loss = (kl * mask).sum() / n_valid
                 del logp_t
             (loss / (num_passes * examples_per_rank)).backward()
+            if master_process and pass_idx == 0:  # one rollout per example, for reading
+                m0 = mask[0]
+                step_samples.append({
+                    "step": step, "source": prompt_source, "question": question,
+                    "answer": tokenizer.decode(completions[0]),
+                    "stopped": bool(completions[0]) and completions[0][-1] == assistant_end,
+                    "tokens": len(completions[0]),
+                    "kl": round(((kl[0].detach() * m0).sum() / m0.sum().clamp(min=1)).item(), 4),
+                })
             step_kl += (kl.detach() * mask).sum().item()
             step_tokens += int(mask.sum().item())
             del logp_s, kl
@@ -319,6 +383,13 @@ for step in range(num_iterations):
     print0(
         f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
     )
+    if master_process:
+        with open(samples_path, "a", encoding="utf-8") as f:
+            for row in step_samples:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if step % 10 == 0 and step_samples:
+            r = step_samples[0]
+            print0(f"  sample (KL {r['kl']}, {r['tokens']} tok, stopped={r['stopped']}) Q: {r['question'][:120]!r}\n  A: {r['answer'][:400]!r}")
     wandb_run.log({
         "step": step,
         "mean_kl": mean_kl,
