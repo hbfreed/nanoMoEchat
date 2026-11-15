@@ -102,6 +102,15 @@ parser.add_argument("--prompts-file", type=str, default="",
 parser.add_argument("--mask-tool-calls", type=int, default=0,
                     help="1: leave the student's calculator <tool_call> spans out of the loss (the teacher does "
                          "not use our tool format); tool outputs are always masked")
+parser.add_argument("--reward-weight", type=float, default=0.0,
+                    help="weight of a GRPO-style sequence reward added to the distillation advantage "
+                         "(group-normalized over each prompt's rollouts; 0: distillation only)")
+parser.add_argument("--format-reward", type=float, default=0.2,
+                    help="gsm8k prompts: reward for ending with '#### <number>' (what the GSM8K eval parses)")
+parser.add_argument("--correct-reward", type=float, default=1.0,
+                    help="gsm8k prompts: reward for a '####' number equal to the gold answer")
+parser.add_argument("--marker-leak-penalty", type=float, default=0.0,
+                    help="non-gsm8k prompts: negative reward for writing '####'")
 parser.add_argument("--truncation-penalty", type=float, default=0.0,
                     help="external teacher: extra per-token advantage penalty (nats) on rollouts that hit "
                          "--max-new-tokens without stopping")
@@ -192,7 +201,7 @@ with open(opsd_path, encoding="utf-8") as f:
         )
         if external:  # Qwen has no document separator in chat; add its empty think block
             teacher_prefix = teacher_prefix[1:] + think_header
-        examples.append((student_prefix, teacher_prefix, row["question"], "cooking"))
+        examples.append((student_prefix, teacher_prefix, row["question"], "cooking", None))
 
 if args.prompts_file:
     import random
@@ -210,7 +219,7 @@ if args.prompts_file:
                 if r.get("teacher_context"):  # privileged: only the teacher sees it
                     tp = tokenizer.render_for_completion({"messages": [
                         {"role": "user", "content": r["prompt"] + "\n\n" + r["teacher_context"]}, dummy]})
-                extra.append((sp, tp[1:] + think_header if external else tp, r["prompt"], r["source"]))
+                extra.append((sp, tp[1:] + think_header if external else tp, r["prompt"], r["source"], r.get("answer")))
     n_cook = min(len(examples), round(len(extra) * args.cook_frac / (1 - args.cook_frac))) if args.cook_frac > 0 else 0
     examples = rng.sample(examples, n_cook) + extra
     rng.shuffle(examples)  # same seed on every rank, so the rank stride splits one shared order
@@ -251,12 +260,30 @@ elif args.dolci_mix:
             if len(sp) > args.max_prompt_tokens:
                 continue
             tp = sp[1:] + think_header if external else sp
-            chosen.append((sp, tp, q, k))
+            chosen.append((sp, tp, q, k, None))
         picked[k] = chosen
     examples = [e for v in picked.values() for e in v]
     rng.shuffle(examples)  # same seed on every rank, so the rank stride splits one shared order
     print0("prompt mix: " + ", ".join(f"{k} {len(v)}" for k, v in picked.items()))
 print0(f"OPSD examples: {len(examples)}")
+
+# GSM8K gold answers for the reward (prompt files store only the question)
+from tasks.gsm8k import extract_answer
+if any(e[3] == "gsm8k" and e[4] is None for e in examples):
+    from datasets import load_dataset
+    gold_by_q = {r["question"]: extract_answer(r["answer"]) for r in load_dataset("openai/gsm8k", "main", split="train")}
+    examples = [e if e[3] != "gsm8k" or e[4] is not None else e[:4] + (gold_by_q.get(e[2]),) for e in examples]
+    missing = sum(e[3] == "gsm8k" and e[4] is None for e in examples)
+    assert missing == 0, f"{missing} gsm8k prompts without a gold answer"
+
+
+def sequence_reward(source, gold, text):
+    """Verifiable reward for one rollout: (reward, has_marker, correct)."""
+    pred = extract_answer(text)
+    if source == "gsm8k":
+        correct = pred is not None and gold is not None and pred.rstrip(".") == gold.rstrip(".")
+        return args.format_reward * (pred is not None) + args.correct_reward * correct, pred is not None, correct
+    return -args.marker_leak_penalty * ("####" in text), "####" in text, False
 
 assert args.examples_per_step % ddp_world_size == 0
 examples_per_rank = args.examples_per_step // ddp_world_size
@@ -324,8 +351,9 @@ mean_kl = float("nan")  # defined even when there are no iterations
 for step in range(num_iterations):
     step_kl, step_tokens, step_stops, step_rollouts, step_truncated = 0.0, 0, 0, 0, 0
     step_samples = []
+    step_marker, step_count, step_correct = {"gsm8k": 0, "other": 0}, {"gsm8k": 0, "other": 0}, 0
     for _ in range(examples_per_rank):
-        student_prefix, teacher_prefix, question, prompt_source = examples[next(rank_example_iter)]
+        student_prefix, teacher_prefix, question, prompt_source, gold = examples[next(rank_example_iter)]
         prefix_len = len(student_prefix)
 
         # ---- rollouts (on-policy, current weights) ----
@@ -368,6 +396,14 @@ for step in range(num_iterations):
                     inside = False
         truncated = torch.tensor([float(len(c) >= args.max_new_tokens and c[-1] != assistant_end)
                                   for c in completions], device=device)
+        texts = [tokenizer.decode(c) for c in completions]
+        rewards = [sequence_reward(prompt_source, gold, t) for t in texts]
+        r = torch.tensor([x[0] for x in rewards], device=device)
+        reward_adv = (r - r.mean()) / (r.std() + 1e-6) if r.std() > 0 else torch.zeros_like(r)
+        kind = "gsm8k" if prompt_source == "gsm8k" else "other"
+        step_marker[kind] += sum(x[1] for x in rewards)
+        step_count[kind] += len(rewards)
+        step_correct += sum(x[2] for x in rewards)
         step_truncated += int(truncated.sum().item())
         padded = [c + [assistant_end] * (n_comp - len(c)) for c in completions]
 
@@ -397,7 +433,8 @@ for step in range(num_iterations):
                 # E[kl] by policy gradient with per-token advantage -kl_t
                 lp_s = logp_s.gather(-1, comp_ids[b0:b1, :, None]).squeeze(-1)
                 kl = lp_s.detach() - logp_t_tok[b0:b1]
-                adv_cost = kl + args.truncation_penalty * truncated[b0:b1, None]
+                adv_cost = (kl + args.truncation_penalty * truncated[b0:b1, None]
+                            - args.reward_weight * reward_adv[b0:b1, None])
                 loss = (adv_cost * lp_s * mask).sum() / n_valid
             else:
                 with torch.no_grad():
@@ -414,6 +451,7 @@ for step in range(num_iterations):
                     "stopped": bool(completions[0]) and completions[0][-1] == assistant_end,
                     "tokens": len(completions[0]),
                     "kl": round(((kl[0].detach() * m0).sum() / m0.sum().clamp(min=1)).item(), 4),
+                    "reward": rewards[0][0],
                 })
             step_kl += (kl.detach() * mask).sum().item()
             step_tokens += int(mask.sum().item())
@@ -431,6 +469,7 @@ for step in range(num_iterations):
     stop_rate = step_stops / max(step_rollouts, 1)
     print0(
         f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | truncated: {step_truncated / max(step_rollouts, 1):.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
+        f" | gsm8k #### {step_marker['gsm8k']}/{step_count['gsm8k']} correct {step_correct} | other #### {step_marker['other']}/{step_count['other']}"
     )
     if master_process:
         with open(samples_path, "a", encoding="utf-8") as f:
@@ -444,6 +483,9 @@ for step in range(num_iterations):
         "mean_kl": mean_kl,
         "stop_rate": stop_rate,
         "truncated_rate": step_truncated / max(step_rollouts, 1),
+        "gsm8k_marker_rate": step_marker["gsm8k"] / max(step_count["gsm8k"], 1),
+        "gsm8k_correct_rate": step_correct / max(step_count["gsm8k"], 1),
+        "other_marker_rate": step_marker["other"] / max(step_count["other"], 1),
         "completion_tokens": step_tokens,
         "lrm": lrm,
     })
