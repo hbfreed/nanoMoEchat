@@ -95,8 +95,13 @@ parser.add_argument("--dolci-mix", type=str, default="",
                          "'general:0.45,ifeval:0.3,math:0.05' (rest: cooking). Categories: general, ifeval, "
                          "math, code. Teacher sees them as is (no passage, no verifier). Empty: cooking only")
 parser.add_argument("--prompts-file", type=str, default="",
-                    help="JSONL of {source, prompt} rows (scripts/build_opd_prompts.py, filtered) mixed with "
-                         "cooking at --cook-frac; replaces --dolci-mix")
+                    help="comma-separated JSONL files of {source, prompt[, teacher_context]} rows "
+                         "(scripts/build_opd_prompts.py, build_easy_cooking.py, build_easy_mix.py), mixed "
+                         "with the OPSD cooking QA at --cook-frac; teacher_context is shown to the teacher "
+                         "only; replaces --dolci-mix")
+parser.add_argument("--truncation-penalty", type=float, default=0.0,
+                    help="external teacher: extra per-token advantage penalty (nats) on rollouts that hit "
+                         "--max-new-tokens without stopping")
 parser.add_argument("--cook-frac", type=float, default=0.2, help="cooking share of prompts with --prompts-file")
 parser.add_argument("--num-prompts", type=int, default=0,
                     help="total prompts with --dolci-mix (0: all cooking prompts at the cooking fraction)")
@@ -128,6 +133,7 @@ model, tokenizer, meta = load_model(
 model.set_defer_bias_updates(True)
 engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
+python_start, python_end = tokenizer.encode_special("<|python_start|>"), tokenizer.encode_special("<|python_end|>")
 out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
 # one rollout per example per step (rank 0): question, answer, per-rollout KL
 samples_path = os.path.join(get_base_dir(), "chatrl_checkpoints", out_tag, "samples.jsonl")
@@ -190,13 +196,19 @@ if args.prompts_file:
     assert not args.dolci_mix, "--prompts-file replaces --dolci-mix"
     rng = random.Random(args.seed)
     extra = []
-    with open(args.prompts_file, encoding="utf-8") as f:
-        for line in f:
-            r = json.loads(line)
-            sp = tokenizer.render_for_completion({"messages": [{"role": "user", "content": r["prompt"]}, dummy]})
-            if len(sp) <= args.max_prompt_tokens:
-                extra.append((sp, sp[1:] + think_header if external else sp, r["prompt"], r["source"]))
-    n_cook = min(len(examples), round(len(extra) * args.cook_frac / (1 - args.cook_frac)))
+    for path in args.prompts_file.split(","):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                sp = tokenizer.render_for_completion({"messages": [{"role": "user", "content": r["prompt"]}, dummy]})
+                if len(sp) > args.max_prompt_tokens:
+                    continue
+                tp = sp
+                if r.get("teacher_context"):  # privileged: only the teacher sees it
+                    tp = tokenizer.render_for_completion({"messages": [
+                        {"role": "user", "content": r["prompt"] + "\n\n" + r["teacher_context"]}, dummy]})
+                extra.append((sp, tp[1:] + think_header if external else tp, r["prompt"], r["source"]))
+    n_cook = min(len(examples), round(len(extra) * args.cook_frac / (1 - args.cook_frac))) if args.cook_frac > 0 else 0
     examples = rng.sample(examples, n_cook) + extra
     rng.shuffle(examples)  # same seed on every rank, so the rank stride splits one shared order
     import collections
@@ -307,7 +319,7 @@ rank_example_iter = itertools.cycle(range(ddp_rank, len(examples), ddp_world_siz
 mean_kl = float("nan")  # defined even when there are no iterations
 
 for step in range(num_iterations):
-    step_kl, step_tokens, step_stops, step_rollouts = 0.0, 0, 0, 0
+    step_kl, step_tokens, step_stops, step_rollouts, step_truncated = 0.0, 0, 0, 0, 0
     step_samples = []
     for _ in range(examples_per_rank):
         student_prefix, teacher_prefix, question, prompt_source = examples[next(rank_example_iter)]
@@ -341,6 +353,19 @@ for step in range(num_iterations):
         comp_mask = torch.zeros(len(completions), n_comp, device=device)
         for i, (c, m) in enumerate(zip(completions, sampled_masks)):
             comp_mask[i, : len(c)] = torch.tensor(m[prefix_len:], dtype=torch.float, device=device)
+            # Leave calculator calls out of the loss: the teacher does not use our calculator
+            # format, so grading them would teach the student to drop the tool.
+            inside = False
+            for t, tokid in enumerate(c):
+                if tokid == python_start:
+                    inside = True
+                if inside:
+                    comp_mask[i, t] = 0.0
+                if tokid == python_end:
+                    inside = False
+        truncated = torch.tensor([float(len(c) >= args.max_new_tokens and c[-1] != assistant_end)
+                                  for c in completions], device=device)
+        step_truncated += int(truncated.sum().item())
         padded = [c + [assistant_end] * (n_comp - len(c)) for c in completions]
 
         student_in = torch.tensor(
@@ -369,7 +394,8 @@ for step in range(num_iterations):
                 # E[kl] by policy gradient with per-token advantage -kl_t
                 lp_s = logp_s.gather(-1, comp_ids[b0:b1, :, None]).squeeze(-1)
                 kl = lp_s.detach() - logp_t_tok[b0:b1]
-                loss = (kl * lp_s * mask).sum() / n_valid
+                adv_cost = kl + args.truncation_penalty * truncated[b0:b1, None]
+                loss = (adv_cost * lp_s * mask).sum() / n_valid
             else:
                 with torch.no_grad():
                     logp_t = token_logprobs_slice(teacher_in[b0:b1], len(teacher_prefix), n_comp)
@@ -401,7 +427,7 @@ for step in range(num_iterations):
     mean_kl = step_kl / max(step_tokens, 1)
     stop_rate = step_stops / max(step_rollouts, 1)
     print0(
-        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
+        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | truncated: {step_truncated / max(step_rollouts, 1):.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
     )
     if master_process:
         with open(samples_path, "a", encoding="utf-8") as f:
@@ -414,6 +440,7 @@ for step in range(num_iterations):
         "step": step,
         "mean_kl": mean_kl,
         "stop_rate": stop_rate,
+        "truncated_rate": step_truncated / max(step_rollouts, 1),
         "completion_tokens": step_tokens,
         "lrm": lrm,
     })
