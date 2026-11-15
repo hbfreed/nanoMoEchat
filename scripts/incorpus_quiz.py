@@ -60,7 +60,8 @@ rows = [json.loads(l) for l in open(pairs_path, encoding="utf-8")]
 sample = random.Random(3).sample(rows, args.n)
 
 for row in sample:
-    ids = [bos, user_start] + tokenizer.encode(row["question"]) + [user_end, assistant_start]
+    ids = tokenizer.render_for_completion(
+        {"messages": [{"role": "user", "content": row["question"]}, {"role": "assistant", "content": ""}]})  # works for both tokenizers
     toks = []
     with autocast_ctx:
         for col, _ in engine.generate(

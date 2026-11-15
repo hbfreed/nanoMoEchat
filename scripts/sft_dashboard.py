@@ -115,7 +115,8 @@ assistant_end = tokenizer.encode_special("<|assistant_end|>")
 
 
 def ask(question, max_tokens=None):
-    ids = [bos, user_start] + tokenizer.encode(question) + [user_end, assistant_start]
+    ids = tokenizer.render_for_completion(
+        {"messages": [{"role": "user", "content": question}, {"role": "assistant", "content": ""}]})  # works for both tokenizers
     toks = []
     with autocast_ctx:
         for col, _ in engine.generate(
@@ -165,7 +166,7 @@ if not args.skip_bpb:
     print("PART 3: FORGETTING GUARD (ClimbMix val bpb; pretrain baseline 0.8278)")
     print("=" * 70)
     seq_len = meta["model_config"]["sequence_len"]
-    token_bytes = get_token_bytes(device=device)
+    token_bytes = get_token_bytes(device=device, name=meta.get("tokenizer"))
     loader = tokenizing_distributed_data_loader(8, seq_len, "val", device=device)
     with autocast_ctx:
         bpb = evaluate_bpb(model, loader, args.bpb_steps, token_bytes)
