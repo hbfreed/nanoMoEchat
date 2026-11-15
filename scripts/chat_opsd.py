@@ -11,19 +11,25 @@ Fully on-policy like chat_rl: rollouts are regenerated every step. One
 example at a time per rank (all its samples share a prompt prefix, which
 keeps the logit slicing trivial).
 
-With --teacher=<HF id> the teacher is instead an external Qwen model (on-policy
-distillation a la Thinking Machines), on its own card. Our tokenizer is trimmed
-from Qwen's (scripts/trim_qwen_tokenizer.py), so the teacher reads our token ids
-through teacher_ids.json and its distribution is restricted to our vocab and
-renormalized; no cross-tokenizer alignment. The teacher gets Qwen's non-thinking
-header (an empty <think></think> block) and, with --teacher-passage, the
-privileged passage too.
+With --teacher=<model> --teacher-url=<vLLM server> the teacher is instead an
+external Qwen model served by vLLM (on-policy distillation a la Thinking
+Machines): one teacher copy on its own card serves every student rank, and it
+only scores rollouts (prompt_logprobs), never generates. Our tokenizer is
+trimmed from Qwen's (scripts/trim_qwen_tokenizer.py), so our token ids map into
+Qwen's through teacher_ids.json; no cross-tokenizer alignment. The teacher gets
+Qwen's non-thinking header (an empty <think></think> block) and, with
+--teacher-passage, the privileged passage too. vLLM returns the teacher's
+log-prob of each sampled token rather than its full distribution, so the loss
+is the per-token sampled estimator: advantage = log p_teacher - log p_student
+on each rollout token, a policy-gradient step on the student (fully on-policy,
+so no importance weights). Self-distillation keeps the exact full-vocab KL.
 
 Run:
-    torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd -- --source=dpo --model-tag=d20 --run=opsd-cook-1
-    # Qwen teacher on physical card 0, students on cards 1+2 (the teacher card is listed last):
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2,0 torchrun --standalone --nproc_per_node=2 \
-        -m scripts.chat_opsd -- --source=sft --model-tag=long10b --teacher=Qwen/Qwen3.5-4B --run=opd-qwen4b
+    torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd --source=dpo --model-tag=d20 --run=opsd-cook-1
+    # vLLM teacher on card 0 (dev-ignore/posttrain/teacher_server.sh), students on cards 1+2:
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2 torchrun --standalone --nproc_per_node=2 \
+        -m scripts.chat_opsd --source=sft --model-tag=d12 --teacher=Qwen/Qwen3.5-4B \
+        --teacher-url=http://localhost:8011 --run=opd-qwen4b
 """
 
 import os
@@ -75,9 +81,9 @@ parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--init-lr-frac", type=float, default=0.01)
 parser.add_argument("--save-every", type=int, default=40)
 parser.add_argument("--teacher", type=str, default=None,
-                    help="HF id of an external Qwen teacher (default: self-distillation)")
-parser.add_argument("--teacher-device", type=int, default=-1,
-                    help="visible CUDA index for the teacher (-1: the last visible device)")
+                    help="model name of an external Qwen teacher served by vLLM (default: self-distillation)")
+parser.add_argument("--teacher-url", type=str, default="http://localhost:8011",
+                    help="vLLM server for --teacher (OpenAI-compatible /v1/completions)")
 parser.add_argument("--teacher-passage", type=int, default=1,
                     help="give an external teacher the privileged passage (1) or only the question (0)")
 parser.add_argument("--out-tag", type=str, default=None,
@@ -104,21 +110,17 @@ engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
 out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
 
-teacher = None
-if args.teacher is not None:
-    from transformers import AutoModelForCausalLM
+external = args.teacher is not None
+if external:
+    import requests
     assert hasattr(tokenizer, "render_turn_start"), "an external teacher needs the trimmed Qwen tokenizer"
     with open(os.path.join(tokenizer.tokenizer_dir, "teacher_ids.json")) as f:
         tid = json.load(f)
-    print0(f"teacher {args.teacher}; our tokenizer was trimmed from {tid['source']}")
-    tdev = torch.device("cuda", args.teacher_device % torch.cuda.device_count())
-    if tdev == device:
-        print0("warning: teacher and student share a card (fine for a smoke test, slow and tight otherwise)")
-    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, dtype=torch.bfloat16).to(tdev).eval()
-    teacher.requires_grad_(False)
-    teacher_ids = torch.tensor(tid["teacher_ids"], dtype=torch.long)
+    teacher_ids = tid["teacher_ids"]  # our id -> Qwen id
     assert len(teacher_ids) == tokenizer.get_vocab_size()
-    teacher_ids_tdev = teacher_ids.to(tdev)
+    served = [m["id"] for m in requests.get(f"{args.teacher_url}/v1/models", timeout=30).json()["data"]]
+    assert args.teacher in served, f"{args.teacher_url} serves {served}, not {args.teacher}"
+    print0(f"teacher {args.teacher} at {args.teacher_url}; our tokenizer was trimmed from {tid['source']}")
     think_header = tokenizer.encode("<think>\n\n</think>\n\n")  # Qwen's non-thinking reply header
 
 # -----------------------------------------------------------------------------
@@ -150,12 +152,12 @@ with open(opsd_path, encoding="utf-8") as f:
             + f"\n\nReference (from \"{row['book']}\"):\n"
             + passage
         )
-        if teacher is not None and not args.teacher_passage:
+        if external and not args.teacher_passage:
             teacher_content = row["question"]
         teacher_prefix = tokenizer.render_for_completion(
             {"messages": [{"role": "user", "content": teacher_content}, dummy]}
         )
-        if teacher is not None:  # Qwen has no document separator in chat; add its empty think block
+        if external:  # Qwen has no document separator in chat; add its empty think block
             teacher_prefix = teacher_prefix[1:] + think_header
         examples.append((student_prefix, teacher_prefix))
 print0(f"OPSD examples: {len(examples)}")
@@ -179,27 +181,28 @@ def token_logprobs_slice(inputs, prefix_len, n_completion):
     return F.log_softmax(sl.float(), dim=-1)
 
 
-def teacher_logprobs_slice(inputs, prefix_len, n_completion):
-    """Teacher log-probs over the completion region, restricted to our vocab and
-    renormalized, as (B, n_completion, V_ours) float32 on the student's device. Also
-    returns the mean probability mass the teacher puts inside our vocab."""
-    if teacher is None:
-        return token_logprobs_slice(inputs, prefix_len, n_completion), 1.0
-    t_in = teacher_ids_tdev[inputs.to(tdev)]
-    assert t_in.size(1) == prefix_len + n_completion
-    # One row at a time: fp32 logits over Qwen's 248k vocab are ~0.5 GB per 512-token row,
-    # and two teacher copies share the teacher card.
-    out, kept = [], []
-    for row in t_in.split(1):
-        # the last n_completion+1 positions; the final one predicts past the end
-        logits = teacher(input_ids=row, logits_to_keep=n_completion + 1).logits[:, :-1].float()
-        full_lse = torch.logsumexp(logits, dim=-1)
-        ours = logits.index_select(-1, teacher_ids_tdev)
-        del logits
-        ours_lse = torch.logsumexp(ours, dim=-1, keepdim=True)
-        kept.append((ours_lse.squeeze(-1) - full_lse).exp().mean())
-        out.append((ours - ours_lse).to(device))
-    return torch.cat(out), torch.stack(kept).mean().item()
+def teacher_token_logprobs(teacher_prefix, completions):
+    """The vLLM teacher's log-prob of each completion token, as a list per completion.
+    Our ids map to Qwen's; the teacher scores prefix + completion as a prompt
+    (prompt_logprobs=0 gives the actual token's log-prob) and generates one dummy token."""
+    prompts = [[teacher_ids[t] for t in teacher_prefix + c] for c in completions]
+    for attempt in range(5):
+        try:
+            r = requests.post(f"{args.teacher_url}/v1/completions", timeout=600, json={
+                "model": args.teacher, "prompt": prompts, "max_tokens": 1,
+                "prompt_logprobs": 0, "temperature": 0.0})
+            r.raise_for_status()
+            choices = sorted(r.json()["choices"], key=lambda c: c["index"])
+            break
+        except (requests.RequestException, KeyError, ValueError) as e:
+            print(f"[rank {ddp_rank}] teacher request failed ({e!r}), retry {attempt + 1}/5")
+            if attempt == 4:
+                raise
+    out = []
+    for ch, p, c in zip(choices, prompts, completions):
+        entries = ch["prompt_logprobs"][len(p) - len(c):]
+        out.append([e[str(q)]["logprob"] for e, q in zip(entries, p[len(p) - len(c):])])
+    return out
 
 
 optimizers = model.setup_optimizers(
@@ -217,7 +220,7 @@ for opt in optimizers:
 rank_example_iter = itertools.cycle(range(ddp_rank, len(examples), ddp_world_size))
 
 for step in range(num_iterations):
-    step_kl, step_tokens, step_stops, step_rollouts, step_kept, kept_n = 0.0, 0, 0, 0, 0.0, 0
+    step_kl, step_tokens, step_stops, step_rollouts = 0.0, 0, 0, 0
     for _ in range(examples_per_rank):
         student_prefix, teacher_prefix = examples[next(rank_example_iter)]
         prefix_len = len(student_prefix)
@@ -230,6 +233,7 @@ for step in range(num_iterations):
                 seed = hash((step, prefix_len, pass_idx)) & 0x7FFFFFFF
                 seqs, _ = engine.generate_batch(
                     student_prefix,
+                    keep_stop=True,  # train on the decision to stop, and count it
                     num_samples=args.gen_batch_size,
                     max_tokens=args.max_new_tokens,
                     temperature=args.temperature,
@@ -253,28 +257,40 @@ for step in range(num_iterations):
         student_in = torch.tensor(
             [student_prefix + c for c in padded], dtype=torch.long, device=device
         )
-        teacher_in = torch.tensor(
-            [teacher_prefix + c for c in padded], dtype=torch.long, device=device
-        )
         comp_ids = torch.tensor(padded, dtype=torch.long, device=device)
+        if external:  # one request per example: its rollouts share the prompt
+            t_lp = teacher_token_logprobs(teacher_prefix, completions)
+            logp_t_tok = torch.zeros(len(completions), n_comp, device=device)
+            for i, lp in enumerate(t_lp):
+                logp_t_tok[i, : len(lp)] = torch.tensor(lp, device=device)
+        else:
+            teacher_in = torch.tensor(
+                [teacher_prefix + c for c in padded], dtype=torch.long, device=device
+            )
 
         # ---- reverse KL(student || teacher) over completion tokens ----
         num_passes = len(completions) // args.device_batch_size
         for pass_idx in range(num_passes):
             b0, b1 = pass_idx * args.device_batch_size, (pass_idx + 1) * args.device_batch_size
-            with torch.no_grad():
-                logp_t, kept = teacher_logprobs_slice(teacher_in[b0:b1], len(teacher_prefix), n_comp)
-            step_kept, kept_n = step_kept + kept, kept_n + 1
-            logp_s = token_logprobs_slice(student_in[b0:b1], prefix_len, n_comp)
-            p_s = logp_s.exp()
-            kl = (p_s * (logp_s - logp_t)).sum(dim=-1)  # (B, n_comp)
             mask = comp_mask[b0:b1]
             n_valid = mask.sum().clamp(min=1)
-            loss = (kl * mask).sum() / n_valid
+            logp_s = token_logprobs_slice(student_in[b0:b1], prefix_len, n_comp)
+            if external:
+                # sampled-token estimator: kl_t = log p_s(x_t) - log p_t(x_t); minimize
+                # E[kl] by policy gradient with per-token advantage -kl_t
+                lp_s = logp_s.gather(-1, comp_ids[b0:b1, :, None]).squeeze(-1)
+                kl = lp_s.detach() - logp_t_tok[b0:b1]
+                loss = (kl * lp_s * mask).sum() / n_valid
+            else:
+                with torch.no_grad():
+                    logp_t = token_logprobs_slice(teacher_in[b0:b1], len(teacher_prefix), n_comp)
+                kl = (logp_s.exp() * (logp_s - logp_t)).sum(dim=-1)  # exact, (B, n_comp)
+                loss = (kl * mask).sum() / n_valid
+                del logp_t
             (loss / (num_passes * examples_per_rank)).backward()
             step_kl += (kl.detach() * mask).sum().item()
             step_tokens += int(mask.sum().item())
-            del logp_s, logp_t, p_s, kl
+            del logp_s, kl
 
     lrm = 1.0 - step / num_iterations
     for opt in optimizers:
@@ -286,16 +302,14 @@ for step in range(num_iterations):
 
     mean_kl = step_kl / max(step_tokens, 1)
     stop_rate = step_stops / max(step_rollouts, 1)
-    teacher_mass = step_kept / max(kept_n, 1)
     print0(
-        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | teacher mass in vocab: {teacher_mass:.4f} | lrm: {lrm:.4f}"
+        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
     )
     wandb_run.log({
         "step": step,
         "mean_kl": mean_kl,
         "stop_rate": stop_rate,
         "completion_tokens": step_tokens,
-        "teacher_mass_in_vocab": teacher_mass,
         "lrm": lrm,
     })
 
