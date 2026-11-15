@@ -299,7 +299,7 @@ if master_process:
             "step": step,
             "val_loss": val_loss,
             **metrics,
-            "model_config": model_config_kwargs,
+            "tokenizer": meta.get("tokenizer"), "model_config": model_config_kwargs,
         },
     )
     print(f"Saved model checkpoint to {checkpoint_dir}")

@@ -198,7 +198,7 @@ for step in range(num_steps):
             f"d{model.config.n_layer}-{args.judge_mode}",
         )
         save_checkpoint(checkpoint_dir, step, model.state_dict(), None,
-                        {"model_config": model.config.__dict__})
+                        {"tokenizer": meta.get("tokenizer"), "model_config": model.config.__dict__})
         print(f"Saved model checkpoint to {checkpoint_dir}")
 
 wandb_run.finish()

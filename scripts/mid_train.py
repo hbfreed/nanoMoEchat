@@ -262,7 +262,7 @@ while True:
             {
                 "step": step,
                 "val_bpb": val_bpb,
-                "model_config": {
+                "tokenizer": meta.get("tokenizer"), "model_config": {
                     **asdict(model.config),
                     "sequence_len": max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),

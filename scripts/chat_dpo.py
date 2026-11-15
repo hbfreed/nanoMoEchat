@@ -265,7 +265,7 @@ if master_process:
         {
             "step": step,
             **val_stats,
-            "model_config": model.config.__dict__,
+            "tokenizer": meta.get("tokenizer"), "model_config": model.config.__dict__,
         },
     )
     print(f"Saved model checkpoint to {checkpoint_dir}")

@@ -265,7 +265,7 @@ for step in range(num_steps):
             step,
             model.state_dict(),
             None,
-            {"model_config": model_config_kwargs},
+            {"tokenizer": meta.get("tokenizer"), "model_config": model_config_kwargs},
         )
         print(f"Saved model checkpoint to {checkpoint_dir}")
 

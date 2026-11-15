@@ -317,7 +317,7 @@ for step in range(num_iterations):
         base_dir = get_base_dir()
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", out_tag)
         save_checkpoint(checkpoint_dir, step, model.state_dict(), None,
-                        {"step": step, "mean_kl": mean_kl, "model_config": model.config.__dict__})
+                        {"step": step, "mean_kl": mean_kl, "tokenizer": meta.get("tokenizer"), "model_config": model.config.__dict__})
         print0(f"Saved checkpoint at step {step}")
 
 # -----------------------------------------------------------------------------
@@ -329,7 +329,7 @@ if master_process:
         num_iterations,
         model.state_dict(),
         None,
-        {"step": num_iterations, "mean_kl": mean_kl, "model_config": model.config.__dict__},
+        {"step": num_iterations, "mean_kl": mean_kl, "tokenizer": meta.get("tokenizer"), "model_config": model.config.__dict__},
     )
     print(f"Saved model checkpoint to {checkpoint_dir}")
 
