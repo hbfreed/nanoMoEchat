@@ -173,7 +173,8 @@ def mid_data_generator(split):
                 if split == "train":
                     last_step = True
         it += 1
-        if num_iterations > 0 and it >= num_iterations:
+        # it counts micro-batches; num_iterations counts optimizer steps
+        if num_iterations > 0 and it >= num_iterations * grad_accum_steps:
             last_step = True
         for i in range(needed_tokens):
             scratch[i] = token_buffer.popleft()
@@ -187,7 +188,7 @@ def mid_data_generator(split):
         )
         if split == "train":
             if num_iterations > 0:
-                approx_progress = it / num_iterations
+                approx_progress = it / (num_iterations * grad_accum_steps)
             else:
                 approx_progress = cursor / dataset_size
         yield inputs, targets

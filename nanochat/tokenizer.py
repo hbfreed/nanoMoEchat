@@ -171,9 +171,22 @@ class QwenTokenizer:
     def id_to_token(self, id):
         return self.tokenizer.id_to_token(id)
 
+    # nanochat's single-token chat markers that have a single-token Qwen equivalent, so the
+    # Engine (stop token, calculator tool) and the training scripts (padding) work unchanged.
+    # Role starts are multi-token in ChatML ("<|im_start|>user\n"), so <|user_start|>,
+    # <|user_end|> and <|assistant_start|> stay None: use render_conversation /
+    # render_for_completion / render_turn_start instead of assembling markers by hand.
+    _NANOCHAT_SPECIALS = {
+        "<|bos|>": "<|endoftext|>",
+        "<|assistant_end|>": "<|im_end|>",
+        "<|python_start|>": "<tool_call>",
+        "<|python_end|>": "</tool_call>",
+        "<|output_start|>": "<tool_response>",
+        "<|output_end|>": "</tool_response>",
+    }
+
     def encode_special(self, text):
-        # None for nanochat's own chat tokens (<|user_start|> etc.), which Qwen does not have
-        return self.tokenizer.token_to_id(text)
+        return self.tokenizer.token_to_id(self._NANOCHAT_SPECIALS.get(text, text))
 
     def get_bos_token_id(self):
         return self.bos_token_id
@@ -195,8 +208,85 @@ class QwenTokenizer:
     def decode(self, ids):
         return self.tokenizer.decode(ids, skip_special_tokens=False)
 
+    def render_turn_start(self, role):
+        """Token ids that open a ChatML turn: <|im_start|>{role}\\n."""
+        return [self.tokenizer.token_to_id("<|im_start|>")] + self.encode(f"{role}\n")
+
     def render_conversation(self, conversation, max_tokens=2048):
-        raise NotImplementedError("chat rendering for the Qwen tokenizer is not implemented yet")
+        """Qwen ChatML, the teacher's own format, so a Qwen teacher scores our sequences in
+        its native template:
+
+            <|endoftext|><|im_start|>system\\n...<|im_end|>\\n
+            <|im_start|>user\\n...<|im_end|>\\n<|im_start|>assistant\\n...<|im_end|>\\n
+
+        The leading <|endoftext|> is the document separator the base model was pretrained
+        with. mask = 1 on assistant content and its <|im_end|> (the stop token the model must
+        learn to emit); role headers, the newline after <|im_end|> and tool outputs are 0.
+        Tool calls use Qwen's <tool_call>/<tool_response> tokens (see encode_special).
+        """
+        ids, mask = [], []
+
+        def add(token_ids, m):
+            if isinstance(token_ids, int):
+                token_ids = [token_ids]
+            ids.extend(token_ids)
+            mask.extend([m] * len(token_ids))
+
+        messages = conversation["messages"]
+        assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
+        im_end, newline = self.tokenizer.token_to_id("<|im_end|>"), self.encode("\n")
+        call_start, call_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
+        out_start, out_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+
+        add(self.get_bos_token_id(), 0)
+        if messages[0]["role"] == "system":
+            add(self.render_turn_start("system"), 0)
+            add(self.encode(messages[0]["content"]), 0)
+            add(im_end, 0)
+            add(newline, 0)
+            messages = messages[1:]
+        for i, message in enumerate(messages):
+            must_be_from = "user" if i % 2 == 0 else "assistant"
+            assert message["role"] == must_be_from, f"Message {i} is from {message['role']} but should be from {must_be_from}"
+            content = message["content"]
+            add(self.render_turn_start(message["role"]), 0)
+            if message["role"] == "user":
+                assert isinstance(content, str), "User messages are simply expected to be strings"
+                add(self.encode(content), 0)
+                add(im_end, 0)
+            else:
+                if isinstance(content, str):
+                    add(self.encode(content), 1)
+                elif isinstance(content, list):
+                    for part in content:
+                        value_ids = self.encode(part["text"])
+                        if part["type"] == "text":
+                            add(value_ids, 1)
+                        elif part["type"] == "python":
+                            add(call_start, 1)
+                            add(value_ids, 1)
+                            add(call_end, 1)
+                        elif part["type"] == "python_output":  # comes from the tool at test time
+                            add(out_start, 0)
+                            add(value_ids, 0)
+                            add(out_end, 0)
+                        else:
+                            raise ValueError(f"Unknown part type: {part['type']}")
+                else:
+                    raise ValueError(f"Unknown content type: {type(content)}")
+                add(im_end, 1)
+            add(newline, 0)
+
+        return ids[:max_tokens], mask[:max_tokens]
+
+    def render_for_completion(self, conversation):
+        """The conversation minus its final assistant message, primed for the assistant's reply."""
+        conversation = copy.deepcopy(conversation)
+        messages = conversation["messages"]
+        assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
+        messages.pop()
+        ids, _ = self.render_conversation(conversation)
+        return ids + self.render_turn_start("assistant")
 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
