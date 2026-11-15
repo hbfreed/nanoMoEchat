@@ -94,6 +94,10 @@ parser.add_argument("--dolci-mix", type=str, default="",
                     help="add Dolci-Instruct-RL prompts as fractions of all prompts, e.g. "
                          "'general:0.45,ifeval:0.3,math:0.05' (rest: cooking). Categories: general, ifeval, "
                          "math, code. Teacher sees them as is (no passage, no verifier). Empty: cooking only")
+parser.add_argument("--prompts-file", type=str, default="",
+                    help="JSONL of {source, prompt} rows (scripts/build_opd_prompts.py, filtered) mixed with "
+                         "cooking at --cook-frac; replaces --dolci-mix")
+parser.add_argument("--cook-frac", type=float, default=0.2, help="cooking share of prompts with --prompts-file")
 parser.add_argument("--num-prompts", type=int, default=0,
                     help="total prompts with --dolci-mix (0: all cooking prompts at the cooking fraction)")
 parser.add_argument("--max-prompt-tokens", type=int, default=512, help="drop Dolci prompts longer than this")
@@ -181,7 +185,23 @@ with open(opsd_path, encoding="utf-8") as f:
             teacher_prefix = teacher_prefix[1:] + think_header
         examples.append((student_prefix, teacher_prefix, row["question"], "cooking"))
 
-if args.dolci_mix:
+if args.prompts_file:
+    import random
+    assert not args.dolci_mix, "--prompts-file replaces --dolci-mix"
+    rng = random.Random(args.seed)
+    extra = []
+    with open(args.prompts_file, encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            sp = tokenizer.render_for_completion({"messages": [{"role": "user", "content": r["prompt"]}, dummy]})
+            if len(sp) <= args.max_prompt_tokens:
+                extra.append((sp, sp[1:] + think_header if external else sp, r["prompt"], r["source"]))
+    n_cook = min(len(examples), round(len(extra) * args.cook_frac / (1 - args.cook_frac)))
+    examples = rng.sample(examples, n_cook) + extra
+    rng.shuffle(examples)  # same seed on every rank, so the rank stride splits one shared order
+    import collections
+    print0("prompt mix: " + ", ".join(f"{k} {v}" for k, v in collections.Counter(e[3] for e in examples).items()))
+elif args.dolci_mix:
     import random
     import pyarrow.parquet as pq
     fracs = {k: float(v) for k, v in (kv.split(":") for kv in args.dolci_mix.split(","))}
