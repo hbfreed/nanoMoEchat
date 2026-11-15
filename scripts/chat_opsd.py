@@ -99,6 +99,9 @@ parser.add_argument("--prompts-file", type=str, default="",
                          "(scripts/build_opd_prompts.py, build_easy_cooking.py, build_easy_mix.py), mixed "
                          "with the OPSD cooking QA at --cook-frac; teacher_context is shown to the teacher "
                          "only; replaces --dolci-mix")
+parser.add_argument("--mask-tool-calls", type=int, default=0,
+                    help="1: leave the student's calculator <tool_call> spans out of the loss (the teacher does "
+                         "not use our tool format); tool outputs are always masked")
 parser.add_argument("--truncation-penalty", type=float, default=0.0,
                     help="external teacher: extra per-token advantage penalty (nats) on rollouts that hit "
                          "--max-new-tokens without stopping")
@@ -356,7 +359,7 @@ for step in range(num_iterations):
             # Leave calculator calls out of the loss: the teacher does not use our calculator
             # format, so grading them would teach the student to drop the tool.
             inside = False
-            for t, tokid in enumerate(c):
+            for t, tokid in enumerate(c if args.mask_tool_calls else ()):
                 if tokid == python_start:
                     inside = True
                 if inside:
