@@ -11,8 +11,19 @@ Fully on-policy like chat_rl: rollouts are regenerated every step. One
 example at a time per rank (all its samples share a prompt prefix, which
 keeps the logit slicing trivial).
 
+With --teacher=<HF id> the teacher is instead an external Qwen model (on-policy
+distillation a la Thinking Machines), on its own card. Our tokenizer is trimmed
+from Qwen's (scripts/trim_qwen_tokenizer.py), so the teacher reads our token ids
+through teacher_ids.json and its distribution is restricted to our vocab and
+renormalized; no cross-tokenizer alignment. The teacher gets Qwen's non-thinking
+header (an empty <think></think> block) and, with --teacher-passage, the
+privileged passage too.
+
 Run:
     torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd -- --source=dpo --model-tag=d20 --run=opsd-cook-1
+    # Qwen teacher on physical card 0, students on cards 1+2 (the teacher card is listed last):
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1,2,0 torchrun --standalone --nproc_per_node=2 \
+        -m scripts.chat_opsd -- --source=sft --model-tag=long10b --teacher=Qwen/Qwen3.5-4B --run=opd-qwen4b
 """
 
 import os
@@ -63,6 +74,14 @@ parser.add_argument("--matrix-lr", type=float, default=0.02)
 parser.add_argument("--weight-decay", type=float, default=0.0)
 parser.add_argument("--init-lr-frac", type=float, default=0.01)
 parser.add_argument("--save-every", type=int, default=40)
+parser.add_argument("--teacher", type=str, default=None,
+                    help="HF id of an external Qwen teacher (default: self-distillation)")
+parser.add_argument("--teacher-device", type=int, default=-1,
+                    help="visible CUDA index for the teacher (-1: the last visible device)")
+parser.add_argument("--teacher-passage", type=int, default=1,
+                    help="give an external teacher the privileged passage (1) or only the question (0)")
+parser.add_argument("--out-tag", type=str, default=None,
+                    help="checkpoint dir name under chatrl_checkpoints (default: --model-tag, else d<n_layer>)")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -83,6 +102,24 @@ model, tokenizer, meta = load_model(
 )
 engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
+out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
+
+teacher = None
+if args.teacher is not None:
+    from transformers import AutoModelForCausalLM
+    assert hasattr(tokenizer, "render_turn_start"), "an external teacher needs the trimmed Qwen tokenizer"
+    with open(os.path.join(tokenizer.tokenizer_dir, "teacher_ids.json")) as f:
+        tid = json.load(f)
+    print0(f"teacher {args.teacher}; our tokenizer was trimmed from {tid['source']}")
+    tdev = torch.device("cuda", args.teacher_device % torch.cuda.device_count())
+    if tdev == device:
+        print0("warning: teacher and student share a card (fine for a smoke test, slow and tight otherwise)")
+    teacher = AutoModelForCausalLM.from_pretrained(args.teacher, dtype=torch.bfloat16).to(tdev).eval()
+    teacher.requires_grad_(False)
+    teacher_ids = torch.tensor(tid["teacher_ids"], dtype=torch.long)
+    assert len(teacher_ids) == tokenizer.get_vocab_size()
+    teacher_ids_tdev = teacher_ids.to(tdev)
+    think_header = tokenizer.encode("<think>\n\n</think>\n\n")  # Qwen's non-thinking reply header
 
 # -----------------------------------------------------------------------------
 # Data: {question, passage, book, chunk}. Student prompt = bare question;
@@ -113,9 +150,13 @@ with open(opsd_path, encoding="utf-8") as f:
             + f"\n\nReference (from \"{row['book']}\"):\n"
             + passage
         )
+        if teacher is not None and not args.teacher_passage:
+            teacher_content = row["question"]
         teacher_prefix = tokenizer.render_for_completion(
             {"messages": [{"role": "user", "content": teacher_content}, dummy]}
         )
+        if teacher is not None:  # Qwen has no document separator in chat; add its empty think block
+            teacher_prefix = teacher_prefix[1:] + think_header
         examples.append((student_prefix, teacher_prefix))
 print0(f"OPSD examples: {len(examples)}")
 
@@ -138,6 +179,24 @@ def token_logprobs_slice(inputs, prefix_len, n_completion):
     return F.log_softmax(sl.float(), dim=-1)
 
 
+def teacher_logprobs_slice(inputs, prefix_len, n_completion):
+    """Teacher log-probs over the completion region, restricted to our vocab and
+    renormalized, as (B, n_completion, V_ours) float32 on the student's device. Also
+    returns the mean probability mass the teacher puts inside our vocab."""
+    if teacher is None:
+        return token_logprobs_slice(inputs, prefix_len, n_completion), 1.0
+    t_in = teacher_ids_tdev[inputs.to(tdev)]
+    assert t_in.size(1) == prefix_len + n_completion
+    # the last n_completion+1 positions; the final one predicts past the end
+    logits = teacher(input_ids=t_in, logits_to_keep=n_completion + 1).logits[:, :-1].float()
+    full_lse = torch.logsumexp(logits, dim=-1)
+    ours = logits.index_select(-1, teacher_ids_tdev)
+    del logits
+    ours_lse = torch.logsumexp(ours, dim=-1, keepdim=True)
+    kept = (ours_lse.squeeze(-1) - full_lse).exp().mean().item()
+    return (ours - ours_lse).to(device, non_blocking=True), kept
+
+
 optimizers = model.setup_optimizers(
     unembedding_lr=args.unembedding_lr,
     embedding_lr=args.embedding_lr,
@@ -153,7 +212,7 @@ for opt in optimizers:
 rank_example_iter = itertools.cycle(range(ddp_rank, len(examples), ddp_world_size))
 
 for step in range(num_iterations):
-    step_kl, step_tokens, step_stops, step_rollouts = 0.0, 0, 0, 0
+    step_kl, step_tokens, step_stops, step_rollouts, step_kept, kept_n = 0.0, 0, 0, 0, 0.0, 0
     for _ in range(examples_per_rank):
         student_prefix, teacher_prefix = examples[next(rank_example_iter)]
         prefix_len = len(student_prefix)
@@ -199,7 +258,8 @@ for step in range(num_iterations):
         for pass_idx in range(num_passes):
             b0, b1 = pass_idx * args.device_batch_size, (pass_idx + 1) * args.device_batch_size
             with torch.no_grad():
-                logp_t = token_logprobs_slice(teacher_in[b0:b1], len(teacher_prefix), n_comp)
+                logp_t, kept = teacher_logprobs_slice(teacher_in[b0:b1], len(teacher_prefix), n_comp)
+            step_kept, kept_n = step_kept + kept, kept_n + 1
             logp_s = token_logprobs_slice(student_in[b0:b1], prefix_len, n_comp)
             p_s = logp_s.exp()
             kl = (p_s * (logp_s - logp_t)).sum(dim=-1)  # (B, n_comp)
@@ -221,20 +281,22 @@ for step in range(num_iterations):
 
     mean_kl = step_kl / max(step_tokens, 1)
     stop_rate = step_stops / max(step_rollouts, 1)
+    teacher_mass = step_kept / max(kept_n, 1)
     print0(
-        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
+        f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | tokens: {step_tokens} | teacher mass in vocab: {teacher_mass:.4f} | lrm: {lrm:.4f}"
     )
     wandb_run.log({
         "step": step,
         "mean_kl": mean_kl,
         "stop_rate": stop_rate,
         "completion_tokens": step_tokens,
+        "teacher_mass_in_vocab": teacher_mass,
         "lrm": lrm,
     })
 
     if master_process and args.save_every > 0 and step > 0 and step % args.save_every == 0:
         base_dir = get_base_dir()
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", f"d{model.config.n_layer}")
+        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", out_tag)
         save_checkpoint(checkpoint_dir, step, model.state_dict(), None,
                         {"step": step, "mean_kl": mean_kl, "model_config": model.config.__dict__})
         print0(f"Saved checkpoint at step {step}")
@@ -242,7 +304,7 @@ for step in range(num_iterations):
 # -----------------------------------------------------------------------------
 if master_process:
     base_dir = get_base_dir()
-    checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", f"d{model.config.n_layer}")
+    checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", out_tag)
     save_checkpoint(
         checkpoint_dir,
         num_iterations,
