@@ -223,6 +223,7 @@ class QwenTokenizer:
         with. mask = 1 on assistant content and its <|im_end|> (the stop token the model must
         learn to emit); role headers, the newline after <|im_end|> and tool outputs are 0.
         Tool calls use Qwen's <tool_call>/<tool_response> tokens (see encode_special).
+        Message content is stripped, as Qwen's template does.
         """
         ids, mask = [], []
 
@@ -241,7 +242,7 @@ class QwenTokenizer:
         add(self.get_bos_token_id(), 0)
         if messages[0]["role"] == "system":
             add(self.render_turn_start("system"), 0)
-            add(self.encode(messages[0]["content"]), 0)
+            add(self.encode(messages[0]["content"].strip()), 0)
             add(im_end, 0)
             add(newline, 0)
             messages = messages[1:]
@@ -252,11 +253,11 @@ class QwenTokenizer:
             add(self.render_turn_start(message["role"]), 0)
             if message["role"] == "user":
                 assert isinstance(content, str), "User messages are simply expected to be strings"
-                add(self.encode(content), 0)
+                add(self.encode(content.strip()), 0)
                 add(im_end, 0)
             else:
                 if isinstance(content, str):
-                    add(self.encode(content), 1)
+                    add(self.encode(content.strip()), 1)
                 elif isinstance(content, list):
                     for part in content:
                         value_ids = self.encode(part["text"])

@@ -21,8 +21,9 @@ Qwen's non-thinking header (an empty <think></think> block) and, with
 --teacher-passage, the privileged passage too. vLLM returns the teacher's
 log-prob of each sampled token rather than its full distribution, so the loss
 is the per-token sampled estimator: advantage = log p_teacher - log p_student
-on each rollout token, a policy-gradient step on the student (fully on-policy,
-so no importance weights). Self-distillation keeps the exact full-vocab KL.
+on each rollout token, a policy-gradient step on the student (rollouts are
+sampled from the full softmax at temperature 1, so no importance weights;
+tool outputs the engine forces are masked out). Self-distillation keeps the exact full-vocab KL.
 
 Run:
     torchrun --standalone --nproc_per_node=2 -m scripts.chat_opsd --source=dpo --model-tag=d20 --run=opsd-cook-1
@@ -39,6 +40,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import itertools
 import json
+import time
 
 import torch
 import torch.distributed as dist
@@ -70,7 +72,9 @@ parser.add_argument("--gen-batch-size", type=int, default=8, help="rollouts per 
 parser.add_argument("--examples-per-step", type=int, default=16, help="examples per optimization step across ranks")
 parser.add_argument("--max-new-tokens", type=int, default=256)
 parser.add_argument("--temperature", type=float, default=1.0, help="rollout sampling temperature (on-policy wants 1.0)")
-parser.add_argument("--top-k", type=int, default=50)
+parser.add_argument("--top-k", type=int, default=0,
+                    help="sample from the top k tokens (<=0: the full distribution; the external-teacher "
+                         "estimator assumes rollouts are drawn from the student's full softmax)")
 parser.add_argument("--max-passage-tokens", type=int, default=1024, help="truncate privileged passages to this many tokens")
 parser.add_argument("--num-epochs", type=int, default=1)
 parser.add_argument("--num-iterations", type=int, default=-1, help="override iteration count (-1 = num_epochs)")
@@ -106,6 +110,10 @@ wandb_run = (
 model, tokenizer, meta = load_model(
     args.source, device, phase="train", model_tag=args.model_tag, step=args.step
 )
+# Freeze the SMEBU router biases: in-forward updates use each rank's local counts, so the
+# replicas would route differently and only rank 0's biases get saved. A short distillation
+# run at a small LR does not need rebalancing.
+model.set_defer_bias_updates(True)
 engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
 out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
@@ -186,22 +194,27 @@ def teacher_token_logprobs(teacher_prefix, completions):
     Our ids map to Qwen's; the teacher scores prefix + completion as a prompt
     (prompt_logprobs=0 gives the actual token's log-prob) and generates one dummy token."""
     prompts = [[teacher_ids[t] for t in teacher_prefix + c] for c in completions]
-    for attempt in range(5):
+    for attempt in range(6):  # backoff 5..160 s: rides out a teacher restart
         try:
-            r = requests.post(f"{args.teacher_url}/v1/completions", timeout=600, json={
+            r = requests.post(f"{args.teacher_url}/v1/completions", timeout=300, json={
                 "model": args.teacher, "prompt": prompts, "max_tokens": 1,
                 "prompt_logprobs": 0, "temperature": 0.0})
+            if 400 <= r.status_code < 500:  # our request is bad (e.g. too long): retrying won't help
+                raise RuntimeError(f"teacher rejected the request: {r.status_code} {r.text[:500]}")
             r.raise_for_status()
             choices = sorted(r.json()["choices"], key=lambda c: c["index"])
             break
         except (requests.RequestException, KeyError, ValueError) as e:
-            print(f"[rank {ddp_rank}] teacher request failed ({e!r}), retry {attempt + 1}/5")
-            if attempt == 4:
+            if attempt == 5:
                 raise
+            print(f"[rank {ddp_rank}] teacher request failed ({e!r}), retry {attempt + 1}/5 in {5 * 2 ** attempt} s")
+            time.sleep(5 * 2 ** attempt)
+    assert len(choices) == len(prompts), f"teacher returned {len(choices)} of {len(prompts)} rows"
     out = []
     for ch, p, c in zip(choices, prompts, completions):
-        entries = ch["prompt_logprobs"][len(p) - len(c):]
-        out.append([e[str(q)]["logprob"] for e, q in zip(entries, p[len(p) - len(c):])])
+        entries = ch["prompt_logprobs"]
+        assert len(entries) == len(p), f"teacher returned {len(entries)} prompt logprobs for {len(p)} tokens"
+        out.append([e[str(q)]["logprob"] for e, q in zip(entries[len(p) - len(c):], p[len(p) - len(c):])])
     return out
 
 
@@ -227,20 +240,21 @@ for step in range(num_iterations):
 
         # ---- rollouts (on-policy, current weights) ----
         model.eval()
-        sequences = []
+        sequences, sampled_masks = [], []  # mask 0: tokens the engine forced (tool outputs)
         with torch.no_grad():
             for pass_idx in range(args.num_samples // args.gen_batch_size):
                 seed = hash((step, prefix_len, pass_idx)) & 0x7FFFFFFF
-                seqs, _ = engine.generate_batch(
+                seqs, gen_masks = engine.generate_batch(
                     student_prefix,
                     keep_stop=True,  # train on the decision to stop, and count it
                     num_samples=args.gen_batch_size,
                     max_tokens=args.max_new_tokens,
                     temperature=args.temperature,
-                    top_k=args.top_k,
+                    top_k=args.top_k if args.top_k > 0 else None,
                     seed=seed,
                 )
                 sequences.extend(seqs)
+                sampled_masks.extend(gen_masks)
         model.train()
 
         completions = [seq[prefix_len:] for seq in sequences]
@@ -250,8 +264,8 @@ for step in range(num_iterations):
 
         # pad completions; padded positions are masked out of the loss
         comp_mask = torch.zeros(len(completions), n_comp, device=device)
-        for i, c in enumerate(completions):
-            comp_mask[i, : len(c)] = 1.0
+        for i, (c, m) in enumerate(zip(completions, sampled_masks)):
+            comp_mask[i, : len(c)] = torch.tensor(m[prefix_len:], dtype=torch.float, device=device)
         padded = [c + [assistant_end] * (n_comp - len(c)) for c in completions]
 
         student_in = torch.tensor(

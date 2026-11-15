@@ -88,6 +88,11 @@ wandb_run = (
 model, tokenizer, meta = load_model(
     "base", device, phase="train", model_tag=args.model_tag, step=args.step
 )
+
+# SMEBU bias updates once per step from counts summed over micro-steps and ranks (as in
+# base_train): in-forward updates use each rank's local counts, so the replicas' router
+# biases drift apart and only rank 0's get saved.
+model.set_defer_bias_updates(True)
 pretrain_batch_size = meta.get("device_batch_size", None)
 device_batch_size = args.device_batch_size
 max_seq_len = args.max_seq_len
@@ -109,7 +114,7 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-token_bytes = get_token_bytes(device=device)
+token_bytes = get_token_bytes(device=device, name=meta.get("tokenizer"))  # bpb needs the model's own vocab
 
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 optimizers = model.setup_optimizers(
@@ -174,7 +179,7 @@ def mid_data_generator(split):
                     last_step = True
         it += 1
         # it counts micro-batches; num_iterations counts optimizer steps
-        if num_iterations > 0 and it >= num_iterations * grad_accum_steps:
+        if split == "train" and num_iterations > 0 and it >= num_iterations * grad_accum_steps:
             last_step = True
         for i in range(needed_tokens):
             scratch[i] = token_buffer.popleft()
@@ -188,7 +193,7 @@ def mid_data_generator(split):
         )
         if split == "train":
             if num_iterations > 0:
-                approx_progress = it / (num_iterations * grad_accum_steps)
+                approx_progress = min(1.0, it / (num_iterations * grad_accum_steps))
             else:
                 approx_progress = cursor / dataset_size
         yield inputs, targets
@@ -278,8 +283,12 @@ while True:
     # single training step
     synchronize()
     t0 = time.time()
+    expert_counts = None
     for micro_step in range(grad_accum_steps):
         logits, loss, combined_aux_loss = model(x, y)
+        if combined_aux_loss is not None and "tokens_per_expert" in combined_aux_loss:
+            c = combined_aux_loss["tokens_per_expert"].long()
+            expert_counts = c if expert_counts is None else expert_counts + c
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -296,6 +305,10 @@ while True:
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if expert_counts is not None:
+        if ddp:
+            dist.all_reduce(expert_counts, op=dist.ReduceOp.SUM)
+        orig_model.update_expert_biases(expert_counts)
     synchronize()
     t1 = time.time()
     dt = t1 - t0

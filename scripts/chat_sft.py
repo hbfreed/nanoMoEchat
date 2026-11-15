@@ -81,6 +81,11 @@ wandb_run = (
 model, tokenizer, meta = load_model(
     args.source, device, phase="train", model_tag=args.model_tag, step=args.step
 )
+
+# SMEBU bias updates once per step from counts summed over micro-steps and ranks (as in
+# base_train): in-forward updates use each rank's local counts, so the replicas' router
+# biases drift apart and only rank 0's get saved.
+model.set_defer_bias_updates(True)
 orig_model = model
 engine = Engine(model, tokenizer)
 
@@ -241,9 +246,13 @@ for step in range(num_iterations):
 
     # evaluate the gradient
     num_tokens = torch.tensor(0, device=device)
+    expert_counts = None
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
         logits, loss, combined_aux_loss = model(train_inputs, train_targets)
+        if combined_aux_loss is not None and "tokens_per_expert" in combined_aux_loss:
+            c = combined_aux_loss["tokens_per_expert"].long()
+            expert_counts = c if expert_counts is None else expert_counts + c
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
@@ -261,6 +270,10 @@ for step in range(num_iterations):
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+    if expert_counts is not None:
+        if ddp:
+            dist.all_reduce(expert_counts, op=dist.ReduceOp.SUM)
+        orig_model.update_expert_biases(expert_counts)
 
     # logging
     train_loss_item = train_loss.item()
