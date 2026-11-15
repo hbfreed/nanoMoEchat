@@ -187,14 +187,19 @@ def teacher_logprobs_slice(inputs, prefix_len, n_completion):
         return token_logprobs_slice(inputs, prefix_len, n_completion), 1.0
     t_in = teacher_ids_tdev[inputs.to(tdev)]
     assert t_in.size(1) == prefix_len + n_completion
-    # the last n_completion+1 positions; the final one predicts past the end
-    logits = teacher(input_ids=t_in, logits_to_keep=n_completion + 1).logits[:, :-1].float()
-    full_lse = torch.logsumexp(logits, dim=-1)
-    ours = logits.index_select(-1, teacher_ids_tdev)
-    del logits
-    ours_lse = torch.logsumexp(ours, dim=-1, keepdim=True)
-    kept = (ours_lse.squeeze(-1) - full_lse).exp().mean().item()
-    return (ours - ours_lse).to(device, non_blocking=True), kept
+    # One row at a time: fp32 logits over Qwen's 248k vocab are ~0.5 GB per 512-token row,
+    # and two teacher copies share the teacher card.
+    out, kept = [], []
+    for row in t_in.split(1):
+        # the last n_completion+1 positions; the final one predicts past the end
+        logits = teacher(input_ids=row, logits_to_keep=n_completion + 1).logits[:, :-1].float()
+        full_lse = torch.logsumexp(logits, dim=-1)
+        ours = logits.index_select(-1, teacher_ids_tdev)
+        del logits
+        ours_lse = torch.logsumexp(ours, dim=-1, keepdim=True)
+        kept.append((ours_lse.squeeze(-1) - full_lse).exp().mean())
+        out.append((ours - ours_lse).to(device))
+    return torch.cat(out), torch.stack(kept).mean().item()
 
 
 optimizers = model.setup_optimizers(
