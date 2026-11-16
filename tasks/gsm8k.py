@@ -34,6 +34,41 @@ def extract_answer(completion):
     return None
 
 
+_NUM = r"-?\$?\d[\d,]*(?:\.\d+)?"
+_BOXED_RE = re.compile(r"\\boxed\{\s*(" + _NUM + r")\s*\}")
+_ANSWER_RE = re.compile(r"(?:answer(?: is)?|total(?: is)?)\s*[:=]?\s*(" + _NUM + ")", re.IGNORECASE)
+_NUM_RE = re.compile(_NUM)
+
+
+def _norm(x):
+    x = x.replace(",", "").replace("$", "").strip().rstrip(".")
+    try:
+        f = float(x)
+        return str(int(f)) if f == int(f) else str(f)
+    except ValueError:
+        return None
+
+
+def extract_final_answer(completion):
+    """Lenient final-answer extraction, for a model that answers naturally: the '####' number,
+    else the last \\boxed{}, else the last 'answer is N' / 'Answer: N' / 'total is N', else the
+    last number on the last non-empty line. Hedged last lines (several different numbers joined
+    by 'or') give None, so listing candidates earns nothing."""
+    for rx in (GSM_RE, _BOXED_RE, _ANSWER_RE):
+        m = rx.findall(completion)
+        if m:
+            return _norm(m[-1])
+    lines = [l for l in completion.strip().splitlines() if l.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    nums = [_norm(n) for n in _NUM_RE.findall(last)]
+    nums = [n for n in nums if n is not None]
+    if not nums or (len(set(nums)) > 1 and re.search(r"\bor\b", last)):
+        return None
+    return nums[-1]
+
+
 class GSM8K(Task):
 
     def __init__(self, subset, split, **kwargs):
@@ -106,6 +141,11 @@ class GSM8K(Task):
         # Compare and return the success as int
         is_correct = int(pred_num == ref_num)
         return is_correct
+
+    def evaluate_lenient(self, conversation, assistant_response):
+        """Like evaluate, but with the lenient final-answer extraction (no '####' required)."""
+        ref = _norm(extract_answer(conversation['messages'][-1]['content'][-1]['text']))
+        return int(extract_final_answer(assistant_response) == ref)
 
     def reward(self, conversation, assistant_response):
         """

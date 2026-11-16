@@ -35,7 +35,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
     # Run the evaluation
-    num_passed, total = 0, 0
+    num_passed, total, num_lenient = 0, 0, 0
+    lenient = hasattr(task_object, "evaluate_lenient")
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -55,6 +56,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         # Evaluate success criteria
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
+        if lenient:
+            num_lenient += int(any(task_object.evaluate_lenient(conversation, c) for c in completions))
 
         # Keep stats
         total += 1
@@ -70,13 +73,18 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     if ddp:
         num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
         total_tensor = torch.tensor([total], dtype=torch.long, device=device)
+        lenient_tensor = torch.tensor([num_lenient], dtype=torch.long, device=device)
         dist.all_reduce(num_passed_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(lenient_tensor, op=dist.ReduceOp.SUM)
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
+        num_lenient = lenient_tensor.item()
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
+    if lenient:  # final answer however stated, alongside the strict '####' score
+        print0(f"Lenient (final answer, any format) accuracy: {100*num_lenient/total:.2f}%")
 
     # Return the accuracy
     return num_passed/total

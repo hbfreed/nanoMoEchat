@@ -106,9 +106,12 @@ parser.add_argument("--reward-weight", type=float, default=0.0,
                     help="weight of a GRPO-style sequence reward added to the distillation advantage "
                          "(group-normalized over each prompt's rollouts; 0: distillation only)")
 parser.add_argument("--format-reward", type=float, default=0.2,
-                    help="gsm8k prompts: reward for ending with '#### <number>' (what the GSM8K eval parses)")
+                    help="gsm8k prompts carrying a format instruction (--gsm8k-format-frac): reward for following it")
 parser.add_argument("--correct-reward", type=float, default=1.0,
-                    help="gsm8k prompts: reward for a '####' number equal to the gold answer")
+                    help="gsm8k prompts: reward when the final answer (lenient extraction, any format) equals gold")
+parser.add_argument("--gsm8k-format-frac", type=float, default=0.0,
+                    help="fraction of gsm8k prompts given an explicit answer-format instruction in the student's "
+                         "(and teacher's) prompt: '#### n', \\boxed{}, 'Answer: n' or the number only")
 parser.add_argument("--gsm8k-teacher-hint", type=str, default="",
                     help="text appended (teacher only) to gsm8k prompts, e.g. a request to end with '#### <number>', "
                          "so the teacher's own distribution includes the answer format the GSM8K eval parses")
@@ -276,22 +279,56 @@ elif args.dolci_mix:
     print0("prompt mix: " + ", ".join(f"{k} {len(v)}" for k, v in picked.items()))
 print0(f"OPSD examples: {len(examples)}")
 
-# GSM8K gold answers for the reward (prompt files store only the question)
-from tasks.gsm8k import extract_answer
-if any(e[3] == "gsm8k" and e[4] is None for e in examples):
+# GSM8K: gold answers (prompt files store only the question) and optional format instructions.
+# The gold slot of a gsm8k example becomes {"gold": str, "fmt": None | format key}.
+import re
+import random as _random
+from tasks.gsm8k import extract_answer, extract_final_answer, _norm
+FORMATS = {  # instruction shown to student and teacher, and a strict check of compliance
+    "hash": ("End with a final line in the form '#### <number>'.",
+             lambda t: re.search(r"(^|\n)\s*####\s*-?\$?\d[\d,]*(\.\d+)?\s*$", t.strip()) is not None),
+    "boxed": ("Put your final answer in \\boxed{}.",
+              lambda t: re.search(r"\\boxed\{\s*-?\$?\d[\d,]*(\.\d+)?\s*\}", t) is not None),
+    "answer": ("Finish with a line of the form 'Answer: <number>'.",
+               lambda t: re.search(r"(^|\n)\s*Answer:\s*-?\$?\d[\d,]*(\.\d+)?\s*\.?\s*$", t.strip()) is not None),
+    "only": ("Reply with only the final number, nothing else.",
+             lambda t: re.fullmatch(r"\s*-?\$?\d[\d,]*(\.\d+)?\s*", t) is not None),
+}
+if any(e[3] == "gsm8k" for e in examples):
     from datasets import load_dataset
-    gold_by_q = {r["question"]: extract_answer(r["answer"]) for r in load_dataset("openai/gsm8k", "main", split="train")}
-    examples = [e if e[3] != "gsm8k" or e[4] is not None else e[:4] + (gold_by_q.get(e[2]),) for e in examples]
-    missing = sum(e[3] == "gsm8k" and e[4] is None for e in examples)
-    assert missing == 0, f"{missing} gsm8k prompts without a gold answer"
+    gold_by_q = {r["question"]: _norm(extract_answer(r["answer"])) for r in load_dataset("openai/gsm8k", "main", split="train")}
+    frng = _random.Random(args.seed + 1)  # same on every rank
+    rebuilt = []
+    for e in examples:
+        if e[3] != "gsm8k":
+            rebuilt.append(e)
+            continue
+        gold = e[4] if isinstance(e[4], dict) else {"gold": e[4] if e[4] is not None else gold_by_q.get(e[2]), "fmt": None}
+        assert gold["gold"] is not None, f"no gold answer for gsm8k prompt {e[2][:80]!r}"
+        if frng.random() < args.gsm8k_format_frac:
+            fmt = frng.choice(sorted(FORMATS))
+            q = e[2] + "\n\n" + FORMATS[fmt][0]
+            sp = tokenizer.render_for_completion({"messages": [{"role": "user", "content": q}, dummy]})
+            e = (sp, sp[1:] + think_header if external else sp, q, "gsm8k", dict(gold, fmt=fmt))
+        else:
+            e = e[:4] + (gold,)
+        rebuilt.append(e)
+    examples = rebuilt
+    print0(f"gsm8k format instructions: {sum(e[3] == 'gsm8k' and e[4]['fmt'] is not None for e in examples)} "
+           f"of {sum(e[3] == 'gsm8k' for e in examples)}")
 
 
 def sequence_reward(source, gold, text):
-    """Verifiable reward for one rollout: (reward, has_marker, correct)."""
-    pred = extract_answer(text)
+    """Verifiable reward for one rollout: (reward, flag, correct). gsm8k: correctness of the final
+    answer however it is stated (lenient), plus format credit only if a format was asked for; flag =
+    format followed (instructed) or '####' present (uninstructed). Other prompts: optional penalty
+    for '####'; flag = '####' present."""
     if source == "gsm8k":
-        correct = pred is not None and gold is not None and pred.rstrip(".") == gold.rstrip(".")
-        return args.format_reward * (pred is not None) + args.correct_reward * correct, pred is not None, correct
+        correct = extract_final_answer(text) == gold["gold"]
+        if gold["fmt"] is not None:
+            ok = FORMATS[gold["fmt"]][1](text)
+            return args.correct_reward * correct + args.format_reward * ok, ok, correct
+        return args.correct_reward * correct, "####" in text, correct
     return -args.marker_leak_penalty * ("####" in text), "####" in text, False
 
 assert args.examples_per_step % ddp_world_size == 0
@@ -360,7 +397,9 @@ mean_kl = float("nan")  # defined even when there are no iterations
 for step in range(num_iterations):
     step_kl, step_tokens, step_stops, step_rollouts, step_truncated = 0.0, 0, 0, 0, 0
     step_samples = []
-    step_marker, step_count, step_correct = {"gsm8k": 0, "other": 0}, {"gsm8k": 0, "other": 0}, 0
+    step_marker = {"gsm8k": 0, "gsm8k-fmt": 0, "other": 0}
+    step_count = {"gsm8k": 0, "gsm8k-fmt": 0, "other": 0}
+    step_correct = 0
     for _ in range(examples_per_rank):
         student_prefix, teacher_prefix, question, prompt_source, gold = examples[next(rank_example_iter)]
         prefix_len = len(student_prefix)
@@ -405,11 +444,12 @@ for step in range(num_iterations):
                     inside = False
         truncated = torch.tensor([float(len(c) >= args.max_new_tokens and c[-1] != assistant_end)
                                   for c in completions], device=device)
-        texts = [tokenizer.decode(c) for c in completions]
+        stop_ids = {assistant_end, tokenizer.get_bos_token_id()}
+        texts = [tokenizer.decode([t for t in c if t not in stop_ids]) for c in completions]  # no stop-token text
         rewards = [sequence_reward(prompt_source, gold, t) for t in texts]
         r = torch.tensor([x[0] for x in rewards], device=device)
         reward_adv = (r - r.mean()) / (r.std() + 1e-6) if r.std() > 0 else torch.zeros_like(r)
-        kind = "gsm8k" if prompt_source == "gsm8k" else "other"
+        kind = ("gsm8k-fmt" if gold["fmt"] else "gsm8k") if prompt_source == "gsm8k" else "other"
         step_marker[kind] += sum(x[1] for x in rewards)
         step_count[kind] += len(rewards)
         step_correct += sum(x[2] for x in rewards)
@@ -485,7 +525,8 @@ for step in range(num_iterations):
     stop_rate = step_stops / max(step_rollouts, 1)
     print0(
         f"Step {step:05d}/{num_iterations:05d} | mean KL: {mean_kl:.4f} | stop rate: {stop_rate:.2f} | truncated: {step_truncated / max(step_rollouts, 1):.2f} | tokens: {step_tokens} | lrm: {lrm:.4f}"
-        f" | gsm8k #### {step_marker['gsm8k']}/{step_count['gsm8k']} correct {step_correct} | other #### {step_marker['other']}/{step_count['other']}"
+        f" | gsm8k correct {step_correct}/{step_count['gsm8k'] + step_count['gsm8k-fmt']} | format followed {step_marker['gsm8k-fmt']}/{step_count['gsm8k-fmt']}"
+        f" | #### uninstructed gsm8k {step_marker['gsm8k']}/{step_count['gsm8k']} other {step_marker['other']}/{step_count['other']}"
     )
     if master_process:
         with open(samples_path, "a", encoding="utf-8") as f:
@@ -499,8 +540,9 @@ for step in range(num_iterations):
         "mean_kl": mean_kl,
         "stop_rate": stop_rate,
         "truncated_rate": step_truncated / max(step_rollouts, 1),
-        "gsm8k_marker_rate": step_marker["gsm8k"] / max(step_count["gsm8k"], 1),
-        "gsm8k_correct_rate": step_correct / max(step_count["gsm8k"], 1),
+        "gsm8k_marker_rate_uninstructed": step_marker["gsm8k"] / max(step_count["gsm8k"], 1),
+        "gsm8k_format_followed_rate": step_marker["gsm8k-fmt"] / max(step_count["gsm8k-fmt"], 1),
+        "gsm8k_correct_rate": step_correct / max(step_count["gsm8k"] + step_count["gsm8k-fmt"], 1),
         "other_marker_rate": step_marker["other"] / max(step_count["other"], 1),
         "completion_tokens": step_tokens,
         "lrm": lrm,
