@@ -43,6 +43,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.02)
 parser.add_argument("--init-lr-frac", type=float, default=0.02, help="as chat_sft")
 parser.add_argument("--hard-weight", type=float, default=0.0, help="weight of plain CE on the sampled token")
 parser.add_argument("--val-frac", type=float, default=0.03)
+parser.add_argument("--val-by-prompt", type=int, default=0, help="1: split train/val by prompt (for multi-sample data)")
 parser.add_argument("--eval-every", type=int, default=25)
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
@@ -70,8 +71,15 @@ for r in rows:
     examples.append((p, r))
 rng = random.Random(args.seed)
 rng.shuffle(examples)
-n_val = max(1, int(len(examples) * args.val_frac))
-val, train = examples[:n_val], examples[n_val:]
+if args.val_by_prompt:  # several answers per prompt: keep each prompt wholly in train or val
+    prompts = sorted({r["prompt"] for _, r in examples})
+    rng.shuffle(prompts)
+    val_prompts = set(prompts[: max(1, int(len(prompts) * args.val_frac))])
+    val = [e for e in examples if e[1]["prompt"] in val_prompts]
+    train = [e for e in examples if e[1]["prompt"] not in val_prompts]
+else:
+    n_val = max(1, int(len(examples) * args.val_frac))
+    val, train = examples[:n_val], examples[n_val:]
 print0(f"{len(rows)} rows, {len(examples)} fit in {max_len} tokens: train {len(train)}, val {len(val)}")
 pad_id = tokenizer.encode_special("<|assistant_end|>")
 K = rows[0]["topk_ids"].shape[1]
