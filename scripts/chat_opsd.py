@@ -109,6 +109,9 @@ parser.add_argument("--format-reward", type=float, default=0.2,
                     help="gsm8k prompts: reward for ending with '#### <number>' (what the GSM8K eval parses)")
 parser.add_argument("--correct-reward", type=float, default=1.0,
                     help="gsm8k prompts: reward for a '####' number equal to the gold answer")
+parser.add_argument("--marker-kl-free", type=int, default=0,
+                    help="1: on gsm8k prompts, leave the '#### <number>' tokens out of the distillation term "
+                         "(the teacher never writes the marker and penalizes it hard); the reward still applies")
 parser.add_argument("--marker-leak-penalty", type=float, default=0.0,
                     help="non-gsm8k prompts: negative reward for writing '####'")
 parser.add_argument("--truncation-penalty", type=float, default=0.0,
@@ -146,6 +149,8 @@ model.set_defer_bias_updates(True)
 engine = Engine(model, tokenizer)
 assistant_end = tokenizer.encode_special("<|assistant_end|>")
 python_start, python_end = tokenizer.encode_special("<|python_start|>"), tokenizer.encode_special("<|python_end|>")
+_m = tokenizer.encode("####")
+marker_id = _m[0] if len(_m) == 1 else None  # "####" is one token in the trimmed Qwen vocab
 out_tag = args.out_tag or args.model_tag or f"d{model.config.n_layer}"
 # one rollout per example per step (rank 0): question, answer, per-rollout KL
 samples_path = os.path.join(get_base_dir(), "chatrl_checkpoints", out_tag, "samples.jsonl")
@@ -411,6 +416,13 @@ for step in range(num_iterations):
             [student_prefix + c for c in padded], dtype=torch.long, device=device
         )
         comp_ids = torch.tensor(padded, dtype=torch.long, device=device)
+        kl_keep = torch.ones(len(completions), n_comp, device=device)  # 0: no distillation term
+        if args.marker_kl_free and prompt_source == "gsm8k":
+            for i, c in enumerate(completions):
+                if marker_id in c:
+                    j = c.index(marker_id)
+                    end = len(c) - 1 if c and c[-1] == assistant_end else len(c)  # the stop token keeps its KL
+                    kl_keep[i, j:end] = 0.0
         if external:  # one request per example: its rollouts share the prompt
             t_lp = teacher_token_logprobs(teacher_prefix, completions)
             logp_t_tok = torch.zeros(len(completions), n_comp, device=device)
@@ -433,7 +445,7 @@ for step in range(num_iterations):
                 # E[kl] by policy gradient with per-token advantage -kl_t
                 lp_s = logp_s.gather(-1, comp_ids[b0:b1, :, None]).squeeze(-1)
                 kl = lp_s.detach() - logp_t_tok[b0:b1]
-                adv_cost = (kl + args.truncation_penalty * truncated[b0:b1, None]
+                adv_cost = (kl * kl_keep[b0:b1] + args.truncation_penalty * truncated[b0:b1, None]
                             - args.reward_weight * reward_adv[b0:b1, None])
                 loss = (adv_cost * lp_s * mask).sum() / n_valid
             else:
