@@ -45,7 +45,7 @@ def _norm(x):
     try:
         f = float(x)
         return str(int(f)) if f == int(f) else str(f)
-    except ValueError:
+    except (ValueError, OverflowError):  # OverflowError: a digit string too long for a float
         return None
 
 
