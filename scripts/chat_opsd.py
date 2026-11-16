@@ -109,6 +109,9 @@ parser.add_argument("--format-reward", type=float, default=0.2,
                     help="gsm8k prompts: reward for ending with '#### <number>' (what the GSM8K eval parses)")
 parser.add_argument("--correct-reward", type=float, default=1.0,
                     help="gsm8k prompts: reward for a '####' number equal to the gold answer")
+parser.add_argument("--gsm8k-teacher-hint", type=str, default="",
+                    help="text appended (teacher only) to gsm8k prompts, e.g. a request to end with '#### <number>', "
+                         "so the teacher's own distribution includes the answer format the GSM8K eval parses")
 parser.add_argument("--marker-kl-free", type=int, default=0,
                     help="1: on gsm8k prompts, leave the '#### <number>' tokens out of the distillation term "
                          "(the teacher never writes the marker and penalizes it hard); the reward still applies")
@@ -221,9 +224,10 @@ if args.prompts_file:
                 if len(sp) > args.max_prompt_tokens:
                     continue
                 tp = sp
-                if r.get("teacher_context"):  # privileged: only the teacher sees it
+                ctx = r.get("teacher_context") or (args.gsm8k_teacher_hint if r["source"] == "gsm8k" else "")
+                if ctx:  # privileged: only the teacher sees it
                     tp = tokenizer.render_for_completion({"messages": [
-                        {"role": "user", "content": r["prompt"] + "\n\n" + r["teacher_context"]}, dummy]})
+                        {"role": "user", "content": r["prompt"] + "\n\n" + ctx}, dummy]})
                 extra.append((sp, tp[1:] + think_header if external else tp, r["prompt"], r["source"], r.get("answer")))
     n_cook = min(len(examples), round(len(extra) * args.cook_frac / (1 - args.cook_frac))) if args.cook_frac > 0 else 0
     examples = rng.sample(examples, n_cook) + extra
